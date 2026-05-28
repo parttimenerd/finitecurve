@@ -59,11 +59,13 @@ function cancelAll() {
   }
 }
 
-function setImage(array) {
+function setImage(arrayOrBuffer) {
   cancelAll();
   for (const w of workers) {
-    const copy = array.slice(0);
-    enqueue(w, { type: 'setImage', seq: nextSeq(), data: copy }, [copy.buffer]);
+    const buf = arrayOrBuffer instanceof ArrayBuffer
+      ? arrayOrBuffer.slice(0)
+      : arrayOrBuffer.buffer.slice(0);
+    enqueue(w, { type: 'setImage', seq: nextSeq(), data: buf }, [buf]);
   }
 }
 

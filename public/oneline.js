@@ -60,6 +60,19 @@ class Image {
     }
   }
 
+  // exposure: 0=very dark, 50=unchanged, 100=very bright
+  adjustExposure(exposure) {
+    if (exposure === 50) return;
+    const factor = exposure < 50
+      ? exposure / 50          // 0..1  (darken)
+      : 1 + (exposure - 50) / 50; // 1..2 (brighten)
+    for (let i = 0, e = this.pixels.length; i < e; i++) {
+      let v = Math.round(this.pixels[i] * factor);
+      if (v > 255) v = 255;
+      this.pixels[i] = v;
+    }
+  }
+
   // Load from ArrayBuffer, scale to fit within maxW x maxH, box-filter smooth=1
   static loadBuffer(arrayBuffer, maxW, maxH, smooth, invert) {
     // Decode image via canvas (works in Worker via OffscreenCanvas or ImageBitmap)
@@ -1160,6 +1173,7 @@ async function build(options, seq) {
     );
   }
 
+  img.adjustExposure(options.exposure != null ? options.exposure : 50);
   img.adjustContrast(options.contrast, options.whiteCutoff, options.invert);
   img.applyEdgeBlend(options.edgeStrength || 0, options.invert);
 

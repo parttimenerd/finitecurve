@@ -130,6 +130,84 @@ async function decodeImageRGBA(arrayBuffer) {
   return { rgbaData: imageData.data, width: bitmap.width, height: bitmap.height };
 }
 
+function buildSegmentationPreview(rgbaData, width, height, colors, controls) {
+  const { whiteCutoff, invert, exposure, contrast, bg } = controls;
+  const channels = separateColors(rgbaData, width, height, colors);
+
+  // Precompute per-channel pixel counts for cutoff check (match worker logic)
+  const expFactor = exposure === 50 ? 1 : (exposure < 50 ? exposure / 50 : 1 + (exposure - 50) / 50);
+  const contrastVal = contrast === 50 ? 1 : (() => {
+    const c = (contrast / 100.0 * 512 - 256);
+    return 259 * (c + 255) / (255 * (259 - c));
+  })();
+
+  function applyLUT(lum) {
+    // exposure
+    let v = Math.min(255, Math.round(lum * expFactor));
+    // contrast
+    if (contrast !== 50) {
+      v = Math.round(contrastVal * (v - 128) + 128);
+      if (v < 0) v = 0;
+      if (v > 255) v = 255;
+    }
+    return v;
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  const out = ctx.createImageData(width, height);
+  const d = out.data;
+
+  // Parse bg color to RGB
+  const bgCanvas = document.createElement('canvas');
+  bgCanvas.width = bgCanvas.height = 1;
+  const bgCtx = bgCanvas.getContext('2d');
+  bgCtx.fillStyle = bg === 'white' ? '#ffffff' : (bg === 'black' ? '#000000' : bg);
+  bgCtx.fillRect(0, 0, 1, 1);
+  const bgPx = bgCtx.getImageData(0, 0, 1, 1).data;
+
+  // Use the exact configured colors, composited lightest→darkest (mirrors SVG luminance sort).
+  const luminance = hex => {
+    const n = parseInt((hex || '888888').replace('#', ''), 16);
+    return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
+  };
+  const colorRGB = colors.map(c => {
+    const n = parseInt((c.hex || '#888888').replace('#', ''), 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  });
+  // lightest first so dark threads paint over light ones
+  const sortedIndices = colors.map((_, i) => i).sort((a, b) => luminance(colors[b].hex) - luminance(colors[a].hex));
+
+  // Fill background
+  for (let i = 0; i < width * height; i++) {
+    d[i * 4]     = bgPx[0];
+    d[i * 4 + 1] = bgPx[1];
+    d[i * 4 + 2] = bgPx[2];
+    d[i * 4 + 3] = 255;
+  }
+
+  // Layer each color channel over the background
+  for (const k of sortedIndices) {
+    const [cr, cg, cb] = colorRGB[k];
+    const ch = channels[k];
+    for (let i = 0; i < width * height; i++) {
+      if (ch[i] === 255) continue;
+      const adjusted = applyLUT(ch[i]);
+      const darkness = invert ? 255 - adjusted : adjusted;
+      if (darkness >= whiteCutoff) continue;
+      d[i * 4]     = cr;
+      d[i * 4 + 1] = cg;
+      d[i * 4 + 2] = cb;
+      d[i * 4 + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(out, 0, 0);
+  return canvas.toDataURL('image/png');
+}
+
 async function suggestPalette(arrayBuffer, n, bgColor) {
   const decoded = await decodeImageRGBA(arrayBuffer);
   if (!decoded) return null;
@@ -234,6 +312,8 @@ class App extends React.Component {
       threadPlan: null,
       originalImageUrl: null,
       showOriginal: false,
+      segPreviewUrl: null,
+      showSegPreview: false,
     };
     OneLineClient.onResult = d => this.processResult(this, d);
   }
@@ -246,6 +326,7 @@ class App extends React.Component {
       timestamp: Date.now(),
       resolution: 30,
       lineWidth: 4,
+      exposure: 50,
       contrast: 50,
       whiteCutoff: 240,
       invert: false,
@@ -487,6 +568,13 @@ class App extends React.Component {
 
     this.setState({ controls: next });
 
+    // Refresh segmentation preview live if it's showing
+    if (this.state.showSegPreview && this._lastDecodedImage) {
+      const { rgbaData, width, height } = this._lastDecodedImage;
+      const url = buildSegmentationPreview(rgbaData, width, height, next.colors, next);
+      this.setState({ segPreviewUrl: url });
+    }
+
     // Live stroke-width: recompose SVG instantly from cached paths — no rebuild needed
     if ('lineWidth' in c && this._lastColorPaths && this.state.ui === uiState.VIEWING) {
       this.recomposeSVG(c.lineWidth);
@@ -544,6 +632,25 @@ class App extends React.Component {
     });
   }
 
+  toggleSegPreview() {
+    if (!this._lastDecodedImage) return;
+    const next = !this.state.showSegPreview;
+    if (next) {
+      const { rgbaData, width, height } = this._lastDecodedImage;
+      const url = buildSegmentationPreview(rgbaData, width, height, this.state.controls.colors, this.state.controls);
+      // If no render has completed yet, set dimensions so the map view works
+      if (!this.state.width || !this.state.height) {
+        const content = document.getElementById('content');
+        const scale = content ? Math.min(content.clientWidth / width, content.clientHeight / height) : 1;
+        this.setState({ showSegPreview: true, segPreviewUrl: url, width, height, map: { scale, translation: { x: 0, y: 0 } } });
+      } else {
+        this.setState({ showSegPreview: true, segPreviewUrl: url });
+      }
+    } else {
+      this.setState({ showSegPreview: false, segPreviewUrl: null });
+    }
+  }
+
   downloadFile(name, url) {
     const element = document.createElement("a");
     element.setAttribute("href", url);
@@ -594,18 +701,22 @@ class App extends React.Component {
           onAutoSuggest={() => this.autoSuggestPalette()}
           onReorderThreads={(from, to) => this.reorderThreads(from, to)}
           onToggleCompare={() => this.setState(s => ({ showOriginal: !s.showOriginal }))}
+          onToggleSegPreview={() => this.toggleSegPreview()}
           canSelect={this.state.ui !== uiState.SELECTING}
           canDownload={this.state.ui === uiState.VIEWING}
           canCompare={!!this.state.originalImageUrl && this.state.ui === uiState.VIEWING}
+          canSegPreview={!!this._lastDecodedImage}
           showOriginal={this.state.showOriginal}
+          showSegPreview={this.state.showSegPreview}
         />
         <div className={classes.content} id="content" style={{ backgroundColor: this.state.background }}>
           <Typography className={classes.toast}>{this.getToastMessage()}</Typography>
           <Typography className={classes.stats}>{this.getStats()}</Typography>
-          {this.getUiStateElement(this.state.ui)}
+          {!this.state.showSegPreview && this.getUiStateElement(this.state.ui)}
           <MapInteractionCSS value={this.state.map} onChange={(c) => this.setState({ map: c })}>
-            <img src={this.state.url} width={this.state.width + "px"} height={this.state.height + "px"} alt="" />
-            {this.state.showOriginal && this.state.originalImageUrl &&
+            <img src={this.state.showSegPreview && this.state.segPreviewUrl ? this.state.segPreviewUrl : this.state.url}
+                 width={this.state.width + "px"} height={this.state.height + "px"} alt="" />
+            {!this.state.showSegPreview && this.state.showOriginal && this.state.originalImageUrl &&
               <img src={this.state.originalImageUrl} width={this.state.width + "px"} height={this.state.height + "px"} alt="original"
                 style={{ position: 'absolute', top: 0, left: 0, opacity: 0.5, pointerEvents: 'none' }} />
             }
@@ -965,6 +1076,9 @@ function AppDrawer(props) {
           <ParameterSlider min={0.1} max={16} value={props.lineWidth} onChange={(e, c) => props.onChange({ lineWidth: c })} step={0.1} title="Stroke width" tooltip="How thick the line should be" />
         </ListItem>
         <ListItem>
+          <ParameterSlider min={0} max={100} value={props.exposure} onChange={(e, c) => props.onChange({ exposure: c })} title="Exposure" tooltip="Brighten or darken the image before rendering (50 = unchanged)" />
+        </ListItem>
+        <ListItem>
           <ParameterSlider min={0} max={100} value={props.contrast} onChange={(e, c) => props.onChange({ contrast: c })} title="Contrast" tooltip="The difference in density between black and white areas" />
         </ListItem>
         <ListItem>
@@ -1021,6 +1135,7 @@ function AppDrawer(props) {
         <Button variant="contained" color="primary" onClick={props.onDownloadSVG} className={classes.lowButton} disabled={!props.canDownload}>Download SVG</Button>
         <Button variant="contained" color="primary" onClick={props.onDownloadPNG} className={classes.lowHighButton} disabled={!props.canDownload}>Download PNG</Button>
         <Button variant="contained" color={props.showOriginal ? "secondary" : "default"} onClick={props.onToggleCompare} className={classes.lowButton} disabled={!props.canCompare}>{props.showOriginal ? "Hide Original" : "Compare"}</Button>
+        <Button variant="contained" color={props.showSegPreview ? "secondary" : "default"} onClick={props.onToggleSegPreview} className={classes.lowButton} disabled={!props.canSegPreview}>{props.showSegPreview ? "Show Render" : "Preview Colors"}</Button>
         <Divider />
         <Button variant="contained" onClick={props.onFeedback} className={classes.lowButton}>Feedback / Issues</Button>
       </List>
