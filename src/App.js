@@ -240,6 +240,10 @@ class App extends React.Component {
       contrast: 50,
       whiteCutoff: 240,
       invert: false,
+      edgeStrength: 0,
+      maxDensity: 10,
+      multiColor: true,
+      fg: "#000000",
       colors: DEFAULT_COLORS.map(c => ({ ...c })),
       bg: "white",
     };
@@ -313,16 +317,23 @@ class App extends React.Component {
       case uiState.SELECTING:
         this.setState({ ui: uiState.PROCESSING }, () => {
           if (!this._lastDecodedImage) return;
-          const { colors, ...commonOptions } = this.state.controls;
+          const { colors, multiColor, fg, ...commonOptions } = this.state.controls;
           const { rgbaData, width, height } = this._lastDecodedImage;
-          const channels = separateColors(rgbaData, width, height, colors);
-          const threads = colors.map((c, i) => ({
-            hex: this.toHexColor(c.hex),
-            grayscaleChannel: channels[i],
-            width,
-            height,
-          }));
-          OneLineClient.buildMulti(threads, commonOptions);
+
+          if (multiColor) {
+            const channels = separateColors(rgbaData, width, height, colors);
+            const threads = colors.map((c, i) => ({
+              hex: this.toHexColor(c.hex),
+              grayscaleChannel: channels[i],
+              width,
+              height,
+            }));
+            OneLineClient.buildMulti(threads, commonOptions);
+          } else {
+            // Single-color: send the full RGBA image, worker decodes it
+            OneLineClient.setImage(this._lastImageBuffer);
+            OneLineClient.build({ ...commonOptions, fg, bg: commonOptions.bg });
+          }
         });
         break;
       default:
@@ -434,7 +445,13 @@ class App extends React.Component {
   processResult(self, data) {
     if (data.success) {
       const isPartial = data.type === 'partial';
-      const url = "data:image/svg+xml;charset=utf-8;base64," + btoa(data.result);
+      let svg = data.result;
+      // Single-color mode: inject fg color (worker always emits stroke='black')
+      if (!this.state.controls.multiColor) {
+        const fgHex = this.toHexColor(this.state.controls.fg);
+        svg = svg.replace("stroke='black'", `stroke='${fgHex}'`);
+      }
+      const url = "data:image/svg+xml;charset=utf-8;base64," + btoa(svg);
       this.setImageUrl(url, data.width, data.height, {
         lineLength: data.lineLength,
         background: this.toHexColor(this.state.controls.bg),
@@ -599,17 +616,35 @@ function AppDrawer(props) {
         <ListItem>
           <ParameterSlider min={0} max={255} value={props.whiteCutoff} onChange={(e, c) => props.onChange({ whiteCutoff: c })} title="White cutoff" tooltip="How white an area has to be to not draw in it" />
         </ListItem>
+        <ListItem>
+          <ParameterSlider min={0} max={100} value={props.edgeStrength} onChange={(e, c) => props.onChange({ edgeStrength: c })} title="Edge strength" tooltip="How much edges attract the line (0 = off)" />
+        </ListItem>
+        <ListItem>
+          <ParameterSlider min={1} max={30} value={props.maxDensity} onChange={(e, c) => props.onChange({ maxDensity: c })} title="Max density" tooltip="Minimum spacing between points — lower = denser lines in dark areas" />
+        </ListItem>
         <ListItem style={{ marginTop: -10 }}>
           <ParameterCheckbox value={props.invert} onChange={(e, c) => props.onChange({ invert: c })} title="Invert image" tooltip="Fill white instead of black" />
         </ListItem>
         <ListItem style={{ marginTop: -10 }}>
+          <ParameterCheckbox value={props.multiColor} onChange={(e, c) => props.onChange({ multiColor: c })} title="Multi-color" tooltip="Separate image into color regions, one thread per color" />
+        </ListItem>
+        <ListItem style={{ marginTop: -10 }}>
           <div style={{ width: '100%' }}>
-            <Typography variant="caption" style={{ display: 'block', marginBottom: 4 }}>Thread colors</Typography>
-            <ColorPaletteEditor
-              colors={props.colors}
-              onChange={colors => props.onChange({ colors })}
-              onAutoSuggest={props.onAutoSuggest}
-            />
+            {props.multiColor ? (
+              <>
+                <Typography variant="caption" style={{ display: 'block', marginBottom: 4 }}>Thread colors</Typography>
+                <ColorPaletteEditor
+                  colors={props.colors}
+                  onChange={colors => props.onChange({ colors })}
+                  onAutoSuggest={props.onAutoSuggest}
+                />
+              </>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center' }}>
+                <Typography variant="caption" style={{ marginRight: 8 }}>Color</Typography>
+                <ColorPicker value={props.fg} hideTextfield disableAlpha onChange={c => props.onChange({ fg: c })} />
+              </div>
+            )}
             <div style={{ display: 'flex', alignItems: 'center', marginTop: 8 }}>
               <Typography variant="caption" style={{ marginRight: 8 }}>Background</Typography>
               <ColorPicker value={props.bg} hideTextfield disableAlpha onChange={c => props.onChange({ bg: c })} />

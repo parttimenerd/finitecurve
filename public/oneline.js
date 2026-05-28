@@ -13,6 +13,38 @@ class Image {
     return this.pixels[y * this.width + x];
   }
 
+  // Blend edge map (Sobel) into pixel values so darker = more edges.
+  // strength 0–100: at 100, edge pixels become fully dark (0); non-edges untouched.
+  // Works in stored-pixel space (invert-aware: "dark" means dense lines).
+  applyEdgeBlend(strength, invert) {
+    if (strength <= 0) return;
+    const w = this.width, h = this.height, p = this.pixels;
+    const t = strength / 100;
+    const edges = new Float32Array(w * h);
+    let maxE = 0;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const gx =
+          -p[(y-1)*w+(x-1)] - 2*p[y*w+(x-1)] - p[(y+1)*w+(x-1)] +
+           p[(y-1)*w+(x+1)] + 2*p[y*w+(x+1)] + p[(y+1)*w+(x+1)];
+        const gy =
+          -p[(y-1)*w+(x-1)] - 2*p[(y-1)*w+x] - p[(y-1)*w+(x+1)] +
+           p[(y+1)*w+(x-1)] + 2*p[(y+1)*w+x] + p[(y+1)*w+(x+1)];
+        const e = Math.sqrt(gx*gx + gy*gy);
+        edges[y*w+x] = e;
+        if (e > maxE) maxE = e;
+      }
+    }
+    if (maxE === 0) return;
+    for (let i = 0; i < w * h; i++) {
+      const edgeStrength = edges[i] / maxE; // 0=flat, 1=strong edge
+      // Edge pixels should appear "dark" (dense lines).
+      // In normal mode, dark = low value; in invert mode, dark = high value.
+      const darkVal = invert ? 255 : 0;
+      p[i] = Math.round(p[i] * (1 - t * edgeStrength) + darkVal * t * edgeStrength);
+    }
+  }
+
   adjustContrast(percent, whiteCutoff, invert) {
     if (percent === 50) return;
     const contrast = (percent / 100.0 * 512 - 256);
@@ -1002,7 +1034,7 @@ function makeConfig(w, h, opts) {
     seed: 0,
     width: w,
     height: h,
-    pointDensity: s(10),
+    pointDensity: s(opts.maxDensity != null ? opts.maxDensity : 10),
     pointDensityWhite: s(50),
     whiteCutoff: opts.whiteCutoff,
     invert: !!opts.invert,
@@ -1102,6 +1134,7 @@ async function build(options, seq) {
   }
 
   img.adjustContrast(options.contrast, options.whiteCutoff, options.invert);
+  img.applyEdgeBlend(options.edgeStrength || 0, options.invert);
 
   const config = makeConfig(img.width, img.height, options);
   const points = new Points(config);
