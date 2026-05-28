@@ -419,8 +419,18 @@ class App extends React.Component {
         this._updateThreadPlanUI();
         OneLineClient.buildMulti(threads, commonOptions);
       } else {
-        OneLineClient.setImage(this._lastImageBuffer);
-        OneLineClient.build({ ...commonOptions, fg, bg: commonOptions.bg });
+        // Single-color: build a plain grayscale channel and use the multi path
+        // so image data travels atomically with the build message (no setImage race).
+        const grayscaleChannel = new Uint8Array(width * height);
+        for (let i = 0; i < width * height; i++) {
+          const a = rgbaData[i * 4 + 3];
+          grayscaleChannel[i] = a < 128 ? 255
+            : Math.round(0.299 * rgbaData[i * 4] + 0.587 * rgbaData[i * 4 + 1] + 0.114 * rgbaData[i * 4 + 2]);
+        }
+        const threads = [{ hex: this.toHexColor(fg), grayscaleChannel, width, height, d: null }];
+        // Don't set _iterThreads — processResult's multiColor branch handles splitting,
+        // which we don't want for single-color.
+        OneLineClient.buildMulti(threads, commonOptions);
       }
     });
   }
