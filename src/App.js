@@ -215,52 +215,88 @@ async function suggestPalette(arrayBuffer, n, bgColor) {
 
   const skipNearWhite = bgColor === 'white' || bgColor === '#ffffff' || bgColor === '#fff';
   const samples = [];
-  const stride = 8; // sample every 8th pixel
+  const stride = 4;
   for (let i = 0; i < width * height; i += stride) {
     const a = rgbaData[i * 4 + 3];
     if (a < 128) continue;
     const r = rgbaData[i * 4], g = rgbaData[i * 4 + 1], b = rgbaData[i * 4 + 2];
-    if (skipNearWhite && (0.299 * r + 0.587 * g + 0.114 * b) > 240) continue;
+    if (skipNearWhite && (0.299 * r + 0.587 * g + 0.114 * b) > 230) continue;
     samples.push([r, g, b]);
   }
   if (samples.length === 0) return null;
 
-  // Initialise centroids spread evenly over luminance-sorted samples
-  const sorted = [...samples].sort(
-    (a, b) => (0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2]) - (0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2])
-  );
-  let centroids = Array.from({ length: n }, (_, i) =>
-    [...sorted[Math.floor(i * sorted.length / n)]]
-  );
+  // Convert to perceptual Lab space for clustering so hue differences
+  // are weighted as strongly as lightness differences.
+  function rgbToLab(r, g, b) {
+    let R = r / 255, G = g / 255, B = b / 255;
+    R = R > 0.04045 ? Math.pow((R + 0.055) / 1.055, 2.4) : R / 12.92;
+    G = G > 0.04045 ? Math.pow((G + 0.055) / 1.055, 2.4) : G / 12.92;
+    B = B > 0.04045 ? Math.pow((B + 0.055) / 1.055, 2.4) : B / 12.92;
+    const X = (R * 0.4124 + G * 0.3576 + B * 0.1805) / 0.95047;
+    const Y = (R * 0.2126 + G * 0.7152 + B * 0.0722) / 1.00000;
+    const Z = (R * 0.0193 + G * 0.1192 + B * 0.9505) / 1.08883;
+    const f = v => v > 0.008856 ? Math.cbrt(v) : 7.787 * v + 16 / 116;
+    return [116 * f(Y) - 16, 500 * (f(X) - f(Y)), 200 * (f(Y) - f(Z))];
+  }
 
+  const labSamples = samples.map(([r, g, b]) => rgbToLab(r, g, b));
+
+  // k-means++ init: pick centroids spread far apart in Lab space
+  const distSq = (a, b) => (a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2;
+  let centroids = [labSamples[Math.floor(Math.random() * labSamples.length)]];
+  while (centroids.length < n) {
+    const dists = labSamples.map(s => Math.min(...centroids.map(c => distSq(s, c))));
+    const total = dists.reduce((a, b) => a + b, 0);
+    let r = Math.random() * total;
+    for (let i = 0; i < dists.length; i++) {
+      r -= dists[i];
+      if (r <= 0) { centroids.push(labSamples[i]); break; }
+    }
+    if (centroids.length < n) centroids.push(labSamples[labSamples.length - 1]);
+  }
+
+  // k-means in Lab space
   let clusterCounts = new Array(n).fill(0);
-  for (let iter = 0; iter < 8; iter++) {
+  for (let iter = 0; iter < 20; iter++) {
     const sums = Array.from({ length: n }, () => [0, 0, 0, 0]);
-    for (const [r, g, b] of samples) {
+    for (const lab of labSamples) {
       let best = 0, bestDist = Infinity;
       for (let k = 0; k < n; k++) {
-        const dr = r - centroids[k][0], dg = g - centroids[k][1], db = b - centroids[k][2];
-        const d = dr * dr + dg * dg + db * db;
+        const d = distSq(lab, centroids[k]);
         if (d < bestDist) { bestDist = d; best = k; }
       }
-      sums[best][0] += r; sums[best][1] += g; sums[best][2] += b; sums[best][3]++;
+      sums[best][0] += lab[0]; sums[best][1] += lab[1]; sums[best][2] += lab[2]; sums[best][3]++;
     }
     const prev = centroids;
-    centroids = sums.map(([r, g, b, c], i) =>
-      c > 0 ? [r / c, g / c, b / c] : prev[i]
-    );
+    centroids = sums.map(([L, a, b, c], i) => c > 0 ? [L/c, a/c, b/c] : prev[i]);
     clusterCounts = sums.map(s => s[3]);
   }
 
-  // Find dominant centroid index (largest cluster) before sorting
+  // Find dominant centroid (largest cluster)
   const dominantIdx = clusterCounts.reduce((best, c, i) => c > clusterCounts[best] ? i : best, 0);
-  const dominantRGB = centroids[dominantIdx];
 
-  // Sort by luminance darkest first — correct embroidery order, darker threads laid first
-  centroids.sort((a, b) => (0.299*a[0]+0.587*a[1]+0.114*a[2]) - (0.299*b[0]+0.587*b[1]+0.114*b[2]));
-  const palette = centroids.map(([r, g, b]) => ({ hex: rgbToHex(r, g, b) }));
+  // Convert centroids back to RGB, clamping to valid range
+  function labToRgb(L, a, b) {
+    const fy = (L + 16) / 116, fx = a / 500 + fy, fz = fy - b / 200;
+    const x = (fx**3 > 0.008856 ? fx**3 : (fx - 16/116) / 7.787) * 0.95047;
+    const y = (fy**3 > 0.008856 ? fy**3 : (fy - 16/116) / 7.787) * 1.00000;
+    const z = (fz**3 > 0.008856 ? fz**3 : (fz - 16/116) / 7.787) * 1.08883;
+    const toSrgb = v => Math.round(Math.min(255, Math.max(0,
+      255 * (v > 0.0031308 ? 1.055 * Math.pow(v, 1/2.4) - 0.055 : 12.92 * v))));
+    return [
+      toSrgb(x *  3.2406 + y * -1.5372 + z * -0.4986),
+      toSrgb(x * -0.9689 + y *  1.8758 + z *  0.0415),
+      toSrgb(x *  0.0557 + y * -0.2040 + z *  1.0570),
+    ];
+  }
 
-  // Mark the dominant color as suggested for duplication
+  const rgbCentroids = centroids.map(([L, a, b]) => labToRgb(L, a, b));
+  const dominantRGB = rgbCentroids[dominantIdx];
+
+  // Sort by luminance darkest first
+  rgbCentroids.sort((a, b) => (0.299*a[0]+0.587*a[1]+0.114*a[2]) - (0.299*b[0]+0.587*b[1]+0.114*b[2]));
+  const palette = rgbCentroids.map(([r, g, b]) => ({ hex: rgbToHex(r, g, b) }));
+
   const domHex = rgbToHex(...dominantRGB);
   const domEntry = palette.find(c => c.hex === domHex);
   if (domEntry) domEntry.suggestDuplicate = true;
