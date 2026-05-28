@@ -341,7 +341,10 @@ class Points {
         if (!this.hasPointsWithin(x, y, d)) {
           const p = this.addPoint(x, y);
           p.shade = shade;
-          p.reach = Math.round(d * cfg.neighborhood / cfg.pointDensity);
+          // Reach must be at least ceil(1.5 * d) so points can find neighbors.
+          // The original ratio neighborhood/pointDensity collapses at small scale
+          // when pointDensity > neighborhood (e.g. high maxDensity, low resolution).
+          p.reach = Math.max(Math.ceil(d * 1.5), Math.round(d * cfg.neighborhood / cfg.pointDensity));
           x += d - 1;
         }
       }
@@ -947,11 +950,18 @@ class Points {
 
   outputSVGLinear() {
     const pts = this.points;
+    const maxReachSq = this.config.maxReach * this.config.maxReach;
     let current = this.startId;
-    let out = `M ${pts[current].x} ${pts[current].y} \n`;
+    let out = `M ${pts[current].x} ${pts[current].y}\n`;
     while (pts[current].next !== NO_ID) {
       const next = pts[current].next;
-      out += `  L ${pts[current].x} ${pts[current].y}\n`;
+      const dx = pts[next].x - pts[current].x;
+      const dy = pts[next].y - pts[current].y;
+      if (dx * dx + dy * dy >= maxReachSq) {
+        out += `M ${pts[next].x} ${pts[next].y}\n`;
+      } else {
+        out += `L ${pts[next].x} ${pts[next].y}\n`;
+      }
       current = next;
     }
     return out;
@@ -989,6 +999,8 @@ class Points {
       return Math.abs(Math.atan2(Math.abs(cross), dot));
     }
 
+    const maxReachSq = this.config.maxReach * this.config.maxReach;
+
     let previous = this.startId;
     let current = this.startId;
     let next = current === NO_ID ? NO_ID : pts[current].next;
@@ -1000,19 +1012,29 @@ class Points {
     let inCurve = false;
 
     do {
-      const angle = turningAngle(pts[previous], pts[current], pts[next]);
-      const straight = angle < straightThreshold;
+      const dx = pts[next].x - pts[current].x;
+      const dy = pts[next].y - pts[current].y;
+      const isLonghaul = dx * dx + dy * dy >= maxReachSq;
 
-      if (straight) {
+      if (isLonghaul) {
         if (inCurve) { out += `\n`; inCurve = false; }
-        out += `L ${pts[next].x} ${pts[next].y}\n`;
+        out += `M ${pts[next].x} ${pts[next].y}\n`;
+        previous = next; // reset curve context after a jump
       } else {
-        if (!inCurve) { out += `C\n`; inCurve = true; }
-        const [cx1, cy1, cx2, cy2] = splineControls(pts[previous], pts[current], pts[next], pts[future !== NO_ID ? future : next]);
-        out += `${cx1},${cy1} ${cx2},${cy2} ${pts[next].x},${pts[next].y}\n`;
+        const angle = turningAngle(pts[previous], pts[current], pts[next]);
+        const straight = angle < straightThreshold;
+
+        if (straight) {
+          if (inCurve) { out += `\n`; inCurve = false; }
+          out += `L ${pts[next].x} ${pts[next].y}\n`;
+        } else {
+          if (!inCurve) { out += `C\n`; inCurve = true; }
+          const [cx1, cy1, cx2, cy2] = splineControls(pts[previous], pts[current], pts[next], pts[future !== NO_ID ? future : next]);
+          out += `${cx1},${cy1} ${cx2},${cy2} ${pts[next].x},${pts[next].y}\n`;
+        }
+        previous = current;
       }
 
-      previous = current;
       current = next;
       next = future;
       future = future !== NO_ID ? pts[future].next : NO_ID;
@@ -1083,6 +1105,9 @@ async function build(options, seq) {
     const yScale = height / dstH;
     const boxW = Math.max(1, Math.round(xScale));
     const boxH = Math.max(1, Math.round(yScale));
+    // Box-filter downsample, excluding empty (255) pixels from the average.
+    // This preserves the sharp boundary between assigned regions and empty space
+    // so component splits survive the resolution reduction.
     for (let y = 0; y < dstH; y++) {
       for (let x = 0; x < dstW; x++) {
         let n = 0, s = 0;
@@ -1094,7 +1119,9 @@ async function build(options, seq) {
           for (let xd = 0; xd < boxW; xd++) {
             const px = px0 + xd;
             if (px >= width) break;
-            s += data[py * width + px];
+            const v = data[py * width + px];
+            if (v === 255) continue; // skip empty pixels
+            s += v;
             n++;
           }
         }
@@ -1140,6 +1167,9 @@ async function build(options, seq) {
   const points = new Points(config);
   points.fillRandom(img);
   points.makeGrid();
+  if (points.points.length < 2) {
+    return { success: true, seq, result: `<svg viewBox='0 0 ${config.width} ${config.height}' width='${config.width}' height='${config.height}' xmlns='http://www.w3.org/2000/svg'><path stroke='black' fill='none' stroke-width='1' d='' /></svg>`, width: config.width, height: config.height, lineLength: 0 };
+  }
   points.setEndPoints();
 
   try {
@@ -1172,7 +1202,25 @@ addEventListener('message', async (event) => {
       break;
     case 'build': {
       const options = JSON.parse(msg.options);
-      const result = await build(options, msg.seq);
+      let result;
+      try {
+        result = await build(options, msg.seq);
+      } catch(e) {
+        result = { success: false, error: String(e) };
+      }
+      result.seq = msg.seq;
+      postMessage(result);
+      break;
+    }
+    case 'buildGrayscale': {
+      setGrayscale(msg.data, msg.width, msg.height);
+      const options = JSON.parse(msg.options);
+      let result;
+      try {
+        result = await build(options, msg.seq);
+      } catch(e) {
+        result = { success: false, error: String(e) };
+      }
       result.seq = msg.seq;
       postMessage(result);
       break;

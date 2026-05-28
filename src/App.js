@@ -23,7 +23,7 @@ import exDog from './examples/dog.jpg';
 import exWorld from './examples/world.png';
 
 import OneLineClient from './OneLineClient.js';
-import { separateColors, computeThreadPlan } from './colorSeparate.js';
+import { separateColors, findLongestSegment, splitChannelAtConnector } from './colorSeparate.js';
 
 import './App.css';
 window.React = React;
@@ -130,17 +130,20 @@ async function decodeImageRGBA(arrayBuffer) {
   return { rgbaData: imageData.data, width: bitmap.width, height: bitmap.height };
 }
 
-async function suggestPalette(arrayBuffer, n, _numThreads) {
+async function suggestPalette(arrayBuffer, n, bgColor) {
   const decoded = await decodeImageRGBA(arrayBuffer);
   if (!decoded) return null;
   const { rgbaData, width, height } = decoded;
 
+  const skipNearWhite = bgColor === 'white' || bgColor === '#ffffff' || bgColor === '#fff';
   const samples = [];
   const stride = 8; // sample every 8th pixel
   for (let i = 0; i < width * height; i += stride) {
     const a = rgbaData[i * 4 + 3];
     if (a < 128) continue;
-    samples.push([rgbaData[i * 4], rgbaData[i * 4 + 1], rgbaData[i * 4 + 2]]);
+    const r = rgbaData[i * 4], g = rgbaData[i * 4 + 1], b = rgbaData[i * 4 + 2];
+    if (skipNearWhite && (0.299 * r + 0.587 * g + 0.114 * b) > 240) continue;
+    samples.push([r, g, b]);
   }
   if (samples.length === 0) return null;
 
@@ -215,6 +218,9 @@ class App extends React.Component {
     this._lastColorPaths = null;
     this._lastThreadPlan = null;
     this._buildTimer = null;
+    // Iterative connector-removal state
+    this._iterThreads = null;   // [{hex, grayscaleChannel, width, height, d}]
+    this._iterPending = null;   // Set of indices into _iterThreads that are being built this round
     this.state = {
       lastDraw: 0,
       url: "data:",
@@ -231,7 +237,6 @@ class App extends React.Component {
   }
 
   componentDidMount() {
-    this.setImageUrl(process.env.PUBLIC_URL + "/splash.jpg", 1920, 1117);
   }
 
   getDefaultControls() {
@@ -246,7 +251,7 @@ class App extends React.Component {
       maxDensity: 10,
       multiColor: true,
       numColors: 6,
-      numThreads: 6,
+      numThreads: 12,
       fg: "#000000",
       colors: DEFAULT_COLORS.map(c => ({ ...c })),
       bg: "white",
@@ -291,7 +296,7 @@ class App extends React.Component {
     decodeImageRGBA(event.data).then(decoded => {
       this._lastDecodedImage = decoded;
       const { numColors } = this.state.controls;
-      return suggestPalette(event.data, numColors).then(palette => {
+      return suggestPalette(event.data, numColors, this.state.controls.bg).then(palette => {
         if (palette) {
           this.setState(
             prev => ({ controls: { ...prev.controls, colors: palette } }),
@@ -306,24 +311,24 @@ class App extends React.Component {
 
   startBuild() {
     if (!this._lastDecodedImage) return;
-    this._lastThreadPlan = null;
+    this._iterThreads = null;
+    this._iterPending = null;
     this.setState({ ui: uiState.PROCESSING, threadPlan: null }, () => {
       const { colors, multiColor, fg, numThreads, ...commonOptions } = this.state.controls;
       const { rgbaData, width, height } = this._lastDecodedImage;
 
       if (multiColor) {
-        const bgHex = this.toHexColor(commonOptions.bg);
-        const channels = separateColors(rgbaData, width, height, colors, bgHex);
-        const plan = computeThreadPlan(colors, channels, width, height, Math.max(numThreads, colors.length));
-        this._lastThreadPlan = plan;
-        this.setState({ threadPlan: plan.map(e => ({ hex: e.hex, colorIndex: e.colorIndex, sliceIndex: e.sliceIndex, totalSlices: e.totalSlices, pixelCount: e.pixelCount })) });
-
-        const threads = plan.map(entry => ({
-          hex: this.toHexColor(entry.hex),
-          grayscaleChannel: entry.grayscaleChannel,
+        const channels = separateColors(rgbaData, width, height, colors);
+        const threads = colors.map((c, i) => ({
+          hex: this.toHexColor(c.hex),
+          grayscaleChannel: channels[i],
           width,
           height,
+          d: null,
         }));
+        this._iterThreads = threads;
+        this._iterPending = new Set(threads.map((_, i) => i));
+        this._updateThreadPlanUI();
         OneLineClient.buildMulti(threads, commonOptions);
       } else {
         OneLineClient.setImage(this._lastImageBuffer);
@@ -332,12 +337,104 @@ class App extends React.Component {
     });
   }
 
+  _updateThreadPlanUI() {
+    const threads = this._iterThreads;
+    if (!threads) return;
+    const plan = threads.map((t, i) => ({
+      hex: t.hex,
+      colorIndex: i,
+      sliceIndex: 0,
+      totalSlices: 1,
+      pixelCount: null,
+    }));
+    this.setState({ threadPlan: plan });
+  }
+
+  // After round 1 completes: greedily split all worst connectors up to thread budget,
+  // then render all resulting threads in a single buildMulti call.
+  _splitAllAndRender() {
+    const threads = this._iterThreads;
+    if (!threads) return false;
+    const { numThreads } = this.state.controls;
+    if (threads.length >= numThreads) return false;
+
+    const { width, height } = this._lastDecodedImage;
+    const { resolution } = this.state.controls;
+    const maxDim = Math.round(resolution * 150);
+    const workerScale = Math.min(maxDim / width, maxDim / height, 1);
+    const invScale = 1 / workerScale;
+    const renderedDiag = Math.sqrt(Math.pow(width * workerScale, 2) + Math.pow(height * workerScale, 2));
+    const minLenSq = Math.pow(renderedDiag * 0.03, 2);
+    const scaleSq = workerScale * workerScale;
+    const minFullResPixels = Math.ceil(50 / scaleSq);
+    const countPixels = ch => { let n = 0; for (let i = 0; i < ch.length; i++) if (ch[i] !== 255) n++; return n; };
+
+    // Work on a mutable copy; `d` values from round 1 drive split decisions.
+    const work = threads.map(t => ({ ...t }));
+    const unsplittable = new Set();
+
+    while (work.length < numThreads) {
+      let worstIdx = -1, worstLenSq = 0;
+      for (let i = 0; i < work.length; i++) {
+        if (unsplittable.has(i) || !work[i].d) continue;
+        const seg = findLongestSegment(work[i].d);
+        if (seg && seg.lengthSq > worstLenSq) { worstLenSq = seg.lengthSq; worstIdx = i; }
+      }
+      if (worstIdx < 0 || worstLenSq < minLenSq) break;
+
+      const t = work[worstIdx];
+      const seg = findLongestSegment(t.d);
+      const halves = splitChannelAtConnector(
+        t.grayscaleChannel, width, height,
+        seg.x0 * invScale, seg.y0 * invScale,
+        seg.x1 * invScale, seg.y1 * invScale,
+      );
+
+      if (halves.length < 2) { unsplittable.add(worstIdx); continue; }
+
+      const countA = countPixels(halves[0]), countB = countPixels(halves[1]);
+      const aOk = countA >= minFullResPixels, bOk = countB >= minFullResPixels;
+
+      if (!aOk && !bOk) { unsplittable.add(worstIdx); continue; }
+
+      if (!aOk || !bOk) {
+        // One half is dust — replace with the large half, mark unsplittable so we don't loop.
+        work[worstIdx] = { ...t, grayscaleChannel: aOk ? halves[0] : halves[1], d: null };
+        unsplittable.add(worstIdx);
+        continue;
+      }
+
+      work[worstIdx] = { ...t, grayscaleChannel: halves[0], d: null };
+      work.push(       { ...t, grayscaleChannel: halves[1], d: null });    }
+
+    const newIndices = new Set();
+    for (let i = 0; i < work.length; i++) {
+      if (work[i].d === null) newIndices.add(i);
+    }
+
+    if (newIndices.size === 0) return false;
+
+    this._iterThreads = work;
+    this._iterPending = newIndices;
+    this._updateThreadPlanUI();
+    this.setState({ ui: uiState.PROCESSING });
+    const { colors: _c, multiColor: _m, fg: _f, numThreads: _n, ...commonOptions } = this.state.controls;
+    OneLineClient.buildMulti(work, commonOptions);
+    return true;
+  }
+
   setStatus(string) {
     this.setState({ status: string });
   }
 
   changeControls(c) {
     const next = { ...this.state.controls, ...c, timestamp: Date.now() };
+
+    // Abort any in-flight render immediately — a new one will start after debounce.
+    if (this.state.ui === uiState.PROCESSING) {
+      OneLineClient.cancel();
+      this.setState({ ui: uiState.VIEWING });
+    }
 
     // When numColors changes: resize colors array, clamp numThreads, re-suggest palette
     if ('numColors' in c && c.numColors !== this.state.controls.numColors) {
@@ -353,7 +450,7 @@ class App extends React.Component {
 
       this.setState({ controls: next }, () => {
         if (this._lastImageBuffer) {
-          suggestPalette(this._lastImageBuffer, n).then(palette => {
+          suggestPalette(this._lastImageBuffer, n, next.bg).then(palette => {
             if (palette) this.changeControls({ colors: palette });
           });
         }
@@ -366,7 +463,7 @@ class App extends React.Component {
       this.setState({ controls: next }, () => {
         if (this._lastImageBuffer) {
           const { numColors } = this.state.controls;
-          suggestPalette(this._lastImageBuffer, numColors).then(palette => {
+          suggestPalette(this._lastImageBuffer, numColors, this.state.controls.bg).then(palette => {
             if (palette) {
               this.setState(
                 prev => ({ controls: { ...prev.controls, colors: palette } }),
@@ -415,10 +512,27 @@ class App extends React.Component {
     this.setState({ ui: uiState.SELECTING });
   }
 
+  reorderThreads(from, to) {
+    const { threadPlan } = this.state;
+    if (!threadPlan || from === to) return;
+    const next = [...threadPlan];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    this.setState({ threadPlan: next });
+
+    if (this._lastColorPaths) {
+      const paths = [...this._lastColorPaths];
+      const [movedPath] = paths.splice(from, 1);
+      paths.splice(to, 0, movedPath);
+      this._lastColorPaths = paths;
+      this.recomposeSVG(this.state.controls.lineWidth);
+    }
+  }
+
   autoSuggestPalette() {
     if (!this._lastImageBuffer) return;
-    const { numColors } = this.state.controls;
-    suggestPalette(this._lastImageBuffer, numColors).then(palette => {
+    const { numColors, bg } = this.state.controls;
+    suggestPalette(this._lastImageBuffer, numColors, bg).then(palette => {
       if (palette) this.changeControls({ colors: palette });
     });
   }
@@ -471,6 +585,7 @@ class App extends React.Component {
           onResetParams={() => this.changeControls(this.getDefaultControls())}
           onFeedback={() => this.openFeedback()}
           onAutoSuggest={() => this.autoSuggestPalette()}
+          onReorderThreads={(from, to) => this.reorderThreads(from, to)}
           canSelect={this.state.ui !== uiState.SELECTING}
           canDownload={this.state.ui === uiState.VIEWING}
         />
@@ -511,14 +626,22 @@ class App extends React.Component {
         const m = svg.match(/\bd='([\s\S]*?)'\s*\/>/);
         if (m) this._lastColorPaths = [{ hex: fgHex, d: m[1].trim() }];
       } else {
+        // Build _lastColorPaths from the assembled SVG for recomposeSVG
         const pathRe = /stroke='([^']+)'[^/]*?d='([\s\S]*?)'\s*\/>/g;
         const paths = [];
         let pm;
         // eslint-disable-next-line no-cond-assign
-        while ((pm = pathRe.exec(svg)) !== null) {
-          paths.push({ hex: pm[1], d: pm[2].trim() });
-        }
+        while ((pm = pathRe.exec(svg)) !== null) paths.push({ hex: pm[1], d: pm[2].trim() });
         if (paths.length > 0) this._lastColorPaths = paths;
+
+        // On final result: use bands[] (indexed by thread) to update _iterThreads directly
+        if (!isPartial && this._iterThreads && this._iterPending && data.bands) {
+          for (const idx of this._iterPending) {
+            this._iterThreads[idx].d = data.bands[idx] || '';
+          }
+          this._iterPending = null;
+          if (this._splitAllAndRender()) return;
+        }
       }
 
       const url = "data:image/svg+xml;charset=utf-8;base64," + btoa(svg);
@@ -612,7 +735,7 @@ function hexLuminance(hex) {
   return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
 }
 
-function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSuggest }) {
+function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSuggest, onReorderThreads }) {
   const MAX_COLORS = 12;
   const MIN_COLORS = 1;
   const dragIdxRef = React.useRef(null);
@@ -671,6 +794,34 @@ function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSu
   function handleDragEnd() {
     dragIdxRef.current = null;
     setDragOver(null);
+  }
+
+  const threadDragIdxRef = React.useRef(null);
+  const [threadDragOver, setThreadDragOver] = React.useState(null);
+
+  function handleThreadDragStart(e, i) {
+    threadDragIdxRef.current = i;
+    e.dataTransfer.effectAllowed = 'move';
+  }
+
+  function handleThreadDragOver(e, i) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setThreadDragOver(i);
+  }
+
+  function handleThreadDrop(e, i) {
+    e.preventDefault();
+    const from = threadDragIdxRef.current;
+    if (from === null || from === i) { setThreadDragOver(null); return; }
+    threadDragIdxRef.current = null;
+    setThreadDragOver(null);
+    onReorderThreads && onReorderThreads(from, i);
+  }
+
+  function handleThreadDragEnd() {
+    threadDragIdxRef.current = null;
+    setThreadDragOver(null);
   }
 
   // Build the thread view from the last computed plan.
@@ -736,7 +887,7 @@ function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSu
 
       {/* ── Thread order (actual build passes) ── */}
       <Typography variant="caption" style={{ display: 'block', marginTop: 8, marginBottom: 2, color: '#555' }}>
-        Threads ({threadRows.length} passes)
+        Threads ({threadRows.length} passes, drag to reorder)
       </Typography>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
         {threadRows.map((entry, i) => {
@@ -749,14 +900,23 @@ function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSu
                 ? `Part ${entry.sliceIndex + 1}/${entry.totalSlices} of this color${entry.pixelCount != null ? ` (${entry.pixelCount.toLocaleString()} px)` : ''}`
                 : (entry.pixelCount != null ? `${entry.pixelCount.toLocaleString()} px` : '')}
             >
-              <div style={{
-                width: 18, height: 18, borderRadius: 3,
-                backgroundColor: entry.hex,
-                border: isMultiSlice ? '2px dashed rgba(0,0,0,0.35)' : '1px solid rgba(0,0,0,0.18)',
-                boxSizing: 'border-box',
-                position: 'relative',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}>
+              <div
+                draggable
+                onDragStart={e => handleThreadDragStart(e, i)}
+                onDragOver={e => handleThreadDragOver(e, i)}
+                onDrop={e => handleThreadDrop(e, i)}
+                onDragEnd={handleThreadDragEnd}
+                style={{
+                  width: 18, height: 18, borderRadius: 3,
+                  backgroundColor: entry.hex,
+                  border: threadDragOver === i
+                    ? '2px solid #1976d2'
+                    : isMultiSlice ? '2px dashed rgba(0,0,0,0.35)' : '1px solid rgba(0,0,0,0.18)',
+                  boxSizing: 'border-box',
+                  position: 'relative',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  cursor: 'grab',
+                }}>
                 {isMultiSlice && (
                   <span style={{ fontSize: 7, color: hexLuminance(entry.hex) > 128 ? '#333' : '#eee', lineHeight: 1, userSelect: 'none' }}>
                     {entry.sliceIndex + 1}
@@ -814,7 +974,7 @@ function AppDrawer(props) {
               <ParameterSlider min={1} max={12} value={props.numColors} onChange={(e, c) => props.onChange({ numColors: c })} step={1} title="Colors" tooltip="Number of distinct thread colors — auto-suggested from image" />
             </ListItem>
             <ListItem>
-              <ParameterSlider min={props.numColors} max={Math.max(props.numColors * 4, 12)} value={props.numThreads} onChange={(e, c) => props.onChange({ numThreads: c })} step={1} title="Threads" tooltip="Total passes — extra passes split a color's disconnected regions to avoid long connector lines" />
+              <ParameterSlider min={props.numColors} max={Math.max(props.numColors * 4, 50)} value={props.numThreads} onChange={(e, c) => props.onChange({ numThreads: c })} step={1} title="Threads" tooltip="Total passes — extra passes split a color's disconnected regions to avoid long connector lines" />
             </ListItem>
           </>
         )}
@@ -827,6 +987,7 @@ function AppDrawer(props) {
                 threadPlan={props.threadPlan}
                 onChange={colors => props.onChange({ colors })}
                 onAutoSuggest={props.onAutoSuggest}
+                onReorderThreads={props.onReorderThreads}
               />
             ) : (
               <div style={{ display: 'flex', alignItems: 'center' }}>

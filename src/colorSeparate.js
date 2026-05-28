@@ -17,29 +17,15 @@ function hexToHSL(hex) {
   return rgbToHSL((n >> 16) & 255, (n >> 8) & 255, n & 255);
 }
 
-function hexToRGB(hex) {
-  const n = parseInt(hex.replace('#', ''), 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
 function hueDist(a, b) {
   const d = Math.abs(a - b) % 360;
   return d > 180 ? 360 - d : d;
 }
 
-// Perceptual color distance in Lab-ish space (fast approximation using weighted RGB).
-function colorDistSq(r1, g1, b1, r2, g2, b2) {
-  const dr = r1 - r2, dg = g1 - g2, db = b1 - b2;
-  // CIE76-approximation weighting
-  const rmean = (r1 + r2) / 2;
-  return (2 + rmean / 256) * dr * dr + 4 * dg * dg + (2 + (255 - rmean) / 256) * db * db;
-}
-
 // For each pixel, assign to nearest-hue thread (by hue angle distance in HSL).
 // Achromatic pixels (saturation < 0.15) go to the thread with lowest luminance.
-// Pixels close to bgHex (within perceptual threshold) are treated as background → 255.
 // Returns N Uint8Arrays, each containing luminance for assigned pixels, 255 elsewhere.
-export function separateColors(rgbaData, width, height, threadColors, bgHex) {
+export function separateColors(rgbaData, width, height, threadColors) {
   const n = threadColors.length;
   const channels = Array.from({ length: n }, () => new Uint8Array(width * height).fill(255));
 
@@ -49,23 +35,12 @@ export function separateColors(rgbaData, width, height, threadColors, bgHex) {
     if (threadHSL[i][2] < threadHSL[darkestIdx][2]) darkestIdx = i;
   }
 
-  // Background suppression: pixels within this perceptual distance² of bgColor are skipped.
-  // Threshold corresponds to ~roughly 20/255 per channel.
-  const bgRGB = bgHex ? hexToRGB(bgHex) : null;
-  const BG_THRESHOLD_SQ = 1800; // ≈ perceptual distance of ~20 units
-
   for (let i = 0; i < width * height; i++) {
     const r = rgbaData[i * 4];
     const g = rgbaData[i * 4 + 1];
     const b = rgbaData[i * 4 + 2];
     const a = rgbaData[i * 4 + 3];
     if (a < 128) continue;
-
-    // Skip pixels that are perceptually close to the background color
-    if (bgRGB) {
-      const d = colorDistSq(r, g, b, bgRGB[0], bgRGB[1], bgRGB[2]);
-      if (d < BG_THRESHOLD_SQ) continue;
-    }
 
     const lum = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
     const [h, s] = rgbToHSL(r, g, b);
@@ -130,12 +105,12 @@ export function splitComponents(channel, width, height) {
   return components;
 }
 
-// Split a channel into up to `maxSlices` Uint8Arrays using a smarter strategy:
-// 1. Find all connected components, sorted largest-first.
-// 2. Small components (< minFraction of the largest) are folded into the nearest
-//    large component's slice based on centroid distance — never left as orphans.
-// 3. The remaining significant components are grouped greedily into `maxSlices` bins
-//    so that each bin's total pixel count is as equal as possible (bin-packing).
+// Split a channel into up to `maxSlices` Uint8Arrays.
+// Strategy: each significant component gets its own slice. When there are more
+// components than slices, we merge the two spatially-closest components (by
+// centroid distance) — so merged components are geographically adjacent and
+// any connector line the algorithm draws between them will be short.
+// Dust (< 1% of total pixels) is assigned to the nearest significant centroid.
 //
 // Returns array of Uint8Arrays (length ≤ maxSlices, ≥ 1).
 export function splitChannelIntoSlices(channel, width, height, maxSlices) {
@@ -147,91 +122,198 @@ export function splitChannelIntoSlices(channel, width, height, maxSlices) {
   const totalPixels = components.reduce((s, c) => s + c.length, 0);
   if (totalPixels === 0) return [channel];
 
-  // Threshold: components smaller than 1% of total are considered "dust"
-  const dustThreshold = Math.max(4, totalPixels * 0.01);
-
-  // Separate significant components from dust
+  const dustThreshold = Math.max(4, totalPixels * 0.001);
   const significant = components.filter(c => c.length >= dustThreshold);
   const dust = components.filter(c => c.length < dustThreshold);
 
   if (significant.length === 0) return [channel];
 
-  // Compute centroids for significant components (for dust assignment)
-  const centroids = significant.map(comp => {
+  // Centroid of each significant component
+  function centroid(comp) {
     let sx = 0, sy = 0;
     for (const idx of comp) { sx += idx % width; sy += (idx / width) | 0; }
     return [sx / comp.length, sy / comp.length];
-  });
+  }
 
-  // Greedy bin-packing: assign significant components to bins to balance pixel count.
-  // Start with one bin per component, merge smallest bins while we exceed maxSlices.
-  const numBins = Math.min(maxSlices, significant.length);
-  // Each bin = list of component indices
-  const bins = significant.map((_, i) => [i]);
+  // Start with one bin per significant component
+  const bins = significant.map((comp, i) => ({ indices: [i], cx: centroid(comp)[0], cy: centroid(comp)[1] }));
 
-  while (bins.length > numBins) {
-    // Find the two bins whose merge produces the smallest combined size
-    let bestMerge = null, bestSize = Infinity;
+  // Merge spatially-closest pair of bins until we reach maxSlices
+  while (bins.length > Math.min(maxSlices, significant.length)) {
+    let bestA = 0, bestB = 1, bestDist = Infinity;
     for (let a = 0; a < bins.length; a++) {
       for (let b = a + 1; b < bins.length; b++) {
-        const sz = bins[a].reduce((s, i) => s + significant[i].length, 0)
-                 + bins[b].reduce((s, i) => s + significant[i].length, 0);
-        if (sz < bestSize) { bestSize = sz; bestMerge = [a, b]; }
+        const dx = bins[a].cx - bins[b].cx, dy = bins[a].cy - bins[b].cy;
+        const d = dx * dx + dy * dy;
+        if (d < bestDist) { bestDist = d; bestA = a; bestB = b; }
       }
     }
-    const [a, b] = bestMerge;
-    bins[a] = [...bins[a], ...bins[b]];
-    bins.splice(b, 1);
+    // Merge bestB into bestA; recompute centroid as pixel-weighted average
+    const totalA = bins[bestA].indices.reduce((s, i) => s + significant[i].length, 0);
+    const totalB = bins[bestB].indices.reduce((s, i) => s + significant[i].length, 0);
+    const tot = totalA + totalB;
+    bins[bestA] = {
+      indices: [...bins[bestA].indices, ...bins[bestB].indices],
+      cx: (bins[bestA].cx * totalA + bins[bestB].cx * totalB) / tot,
+      cy: (bins[bestA].cy * totalA + bins[bestB].cy * totalB) / tot,
+    };
+    bins.splice(bestB, 1);
   }
 
   const size = width * height;
   const slices = Array.from({ length: bins.length }, () => new Uint8Array(size).fill(255));
 
-  // Fill significant component pixels into their bin's slice
   for (let s = 0; s < bins.length; s++) {
-    for (const ci of bins[s]) {
+    for (const ci of bins[s].indices) {
       for (const idx of significant[ci]) {
         slices[s][idx] = channel[idx];
       }
     }
   }
 
-  // Assign dust to the nearest significant-component centroid's slice
+  // Assign dust to the nearest bin centroid
   for (const dustComp of dust) {
-    // Use centroid of the dust component
     let dsx = 0, dsy = 0;
     for (const idx of dustComp) { dsx += idx % width; dsy += (idx / width) | 0; }
     const dcx = dsx / dustComp.length, dcy = dsy / dustComp.length;
 
-    // Find nearest significant centroid
     let nearest = 0, nearestDist = Infinity;
-    for (let ci = 0; ci < centroids.length; ci++) {
-      const dx = dcx - centroids[ci][0], dy = dcy - centroids[ci][1];
+    for (let s = 0; s < bins.length; s++) {
+      const dx = dcx - bins[s].cx, dy = dcy - bins[s].cy;
       const d = dx * dx + dy * dy;
-      if (d < nearestDist) { nearestDist = d; nearest = ci; }
+      if (d < nearestDist) { nearestDist = d; nearest = s; }
     }
-
-    // Find which bin owns the nearest significant component
-    const ownerBin = bins.findIndex(b => b.includes(nearest));
-    if (ownerBin >= 0) {
-      for (const idx of dustComp) slices[ownerBin][idx] = channel[idx];
-    }
+    for (const idx of dustComp) slices[nearest][idx] = channel[idx];
   }
 
   return slices;
 }
 
-// Compute the actual thread plan given colors, their channels, and total thread budget.
+// Parse an SVG path d string and return the longest connector jump as
+// { x0, y0, x1, y1, lengthSq }. Connector jumps are internal M (moveto) commands
+// — the worker emits M instead of L when a tour step exceeds the longhaul threshold,
+// so these represent actual jumps between disconnected regions, not stitches.
+export function findLongestSegment(d) {
+  if (!d) return null;
+  let best = null;
+  let cx = 0, cy = 0;
+  let firstM = true;
+  // Tokenize: command letter followed by all numeric tokens until next letter
+  const cmdRe = /([MLCc])([\s\S]*?)(?=[MLCc]|$)/g;
+  const numRe = /([-\d.]+)/g;
+  let m;
+  while ((m = cmdRe.exec(d)) !== null) {
+    const cmd = m[1];
+    const nums = [];
+    let n;
+    numRe.lastIndex = 0;
+    while ((n = numRe.exec(m[2])) !== null) nums.push(parseFloat(n[1]));
+    if (cmd === 'M' && nums.length >= 2) {
+      const x = nums[0], y = nums[1];
+      if (!firstM) {
+        const dx = x - cx, dy = y - cy;
+        const lsq = dx * dx + dy * dy;
+        if (!best || lsq > best.lengthSq) {
+          best = { x0: cx, y0: cy, x1: x, y1: y, lengthSq: lsq };
+        }
+      }
+      firstM = false;
+      cx = x; cy = y;
+    } else if (cmd === 'L' && nums.length >= 2) {
+      cx = nums[0]; cy = nums[1];
+    } else if (cmd === 'C' && nums.length >= 6) {
+      // Cubic bezier: cp1x,cp1y cp2x,cp2y endx,endy — endpoint is last pair
+      cx = nums[nums.length - 2]; cy = nums[nums.length - 1];
+    }
+  }
+  return best;
+}
+
+// Split a grayscale channel into two channels by flood-filling from each side
+// of a connector line. The connector goes from (x0,y0) to (x1,y1) in image
+// coordinates. We find the assigned pixel nearest each endpoint and flood-fill
+// from there; any pixel reachable from endpoint A goes to channelA, the rest
+// (reachable from B or unreachable) go to channelB.
+export function splitChannelAtConnector(channel, width, height, x0, y0, x1, y1) {
+  const size = width * height;
+
+  // Find all connected components with their centroids, sorted largest-first
+  const visited = new Uint8Array(size);
+  const comps = [];
+  for (let start = 0; start < size; start++) {
+    if (channel[start] === 255 || visited[start]) continue;
+    const pixels = [];
+    const queue = [start];
+    visited[start] = 1;
+    let head = 0;
+    while (head < queue.length) {
+      const idx = queue[head++];
+      pixels.push(idx);
+      const qx = idx % width, qy = (idx / width) | 0;
+      if (qx > 0 && !visited[idx-1] && channel[idx-1] !== 255) { visited[idx-1]=1; queue.push(idx-1); }
+      if (qx < width-1 && !visited[idx+1] && channel[idx+1] !== 255) { visited[idx+1]=1; queue.push(idx+1); }
+      if (qy > 0 && !visited[idx-width] && channel[idx-width] !== 255) { visited[idx-width]=1; queue.push(idx-width); }
+      if (qy < height-1 && !visited[idx+width] && channel[idx+width] !== 255) { visited[idx+width]=1; queue.push(idx+width); }
+    }
+    let sx = 0, sy = 0;
+    for (const i of pixels) { sx += i % width; sy += (i / width) | 0; }
+    comps.push({ pixels, cx: sx / pixels.length, cy: sy / pixels.length });
+  }
+  comps.sort((a, b) => b.pixels.length - a.pixels.length);
+
+  if (comps.length < 2) return [channel];
+
+  // Find which component centroid is nearest each connector endpoint
+  function nearestComp(px, py) {
+    let best = 0, bestDist = Infinity;
+    for (let ci = 0; ci < comps.length; ci++) {
+      const d = (comps[ci].cx - px) ** 2 + (comps[ci].cy - py) ** 2;
+      if (d < bestDist) { bestDist = d; best = ci; }
+    }
+    return best;
+  }
+
+  const idxA = nearestComp(x0, y0);
+  const idxB = nearestComp(x1, y1);
+  if (idxA === idxB) return [channel];
+
+  // Split: A-side = idxA, B-side = idxB, remaining by proximity to A vs B centroid
+  const inA = new Uint8Array(size);
+  for (let ci = 0; ci < comps.length; ci++) {
+    let side;
+    if (ci === idxA) {
+      side = true;
+    } else if (ci === idxB) {
+      side = false;
+    } else {
+      const dA = (comps[ci].cx - comps[idxA].cx) ** 2 + (comps[ci].cy - comps[idxA].cy) ** 2;
+      const dB = (comps[ci].cx - comps[idxB].cx) ** 2 + (comps[ci].cy - comps[idxB].cy) ** 2;
+      side = dA <= dB;
+    }
+    if (side) for (const i of comps[ci].pixels) inA[i] = 1;
+  }
+
+  const chA = new Uint8Array(size).fill(255);
+  const chB = new Uint8Array(size).fill(255);
+  for (let i = 0; i < size; i++) {
+    if (channel[i] !== 255) {
+      if (inA[i]) chA[i] = channel[i]; else chB[i] = channel[i];
+    }
+  }
+  return [chA, chB];
+}
 // Returns [{hex, colorIndex, sliceIndex, totalSlices, pixelCount}], sorted by
 // embroidery order (color order preserved, slices within a color largest-first).
 export function computeThreadPlan(colors, channels, width, height, totalThreads) {
   const n = colors.length;
 
-  // Count significant components per color (determines how many splits are useful)
+  // Count significant components per color (determines how many splits are useful).
+  // Use a tight threshold (0.1% of pixels or min 4) so small-but-real components
+  // are counted and get their own thread slot when budget allows.
   const componentCounts = channels.map(ch => {
     const comps = splitComponents(ch, width, height);
     const total = comps.reduce((s, c) => s + c.length, 0);
-    const dust = Math.max(4, total * 0.01);
+    const dust = Math.max(4, total * 0.001);
     return comps.filter(c => c.length >= dust).length;
   });
 
