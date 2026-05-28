@@ -1,38 +1,28 @@
-const worker = new Worker("oneline.js");
+const worker = new Worker(process.env.PUBLIC_URL + '/oneline.js');
 worker.onmessage = handleMessage;
 let seq = 1;
 
 function setImage(array) {
-  let msg = {
-    type: "setImage",
-    seq: seq++,
-    data: array,
-  };
-  worker.postMessage(msg);
+  // Transfer the ArrayBuffer to avoid copying
+  const copy = array.slice(0);
+  worker.postMessage({ type: 'setImage', seq: seq++, data: copy }, [copy]);
 }
 
 function build(options) {
-  let msg = {
-    type: "build",
-    seq: seq++,
-    options: JSON.stringify(options),
-  };
-  worker.postMessage(msg);
+  worker.postMessage({ type: 'build', seq: seq++, options: JSON.stringify(options) });
 }
 
 function handleMessage(msg) {
-  // console.log("Received message from webworker", msg);
-  if(exports.onResult) {
-    exports.onResult(msg.data);
+  if (client.onResult) {
+    client.onResult(msg.data);
   }
 }
 
-let exports = {
-  worker: worker,
-  setImage: setImage,
-  build: build,
+const client = {
+  worker,
+  setImage,
+  build,
   onResult: undefined,
 };
 
-export default exports;
-
+export default client;

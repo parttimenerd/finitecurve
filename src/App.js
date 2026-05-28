@@ -345,14 +345,15 @@ class App extends React.Component {
 
   processResult(self, data) {
     if (data.success) {
+      const isPartial = data.type === 'partial';
       let url = "data:image/svg+xml;charset=utf-8;base64," + btoa(this.swapForeground(data.result, this.toHexColor(this.state.controls.fg)));
-      this.setImageUrl(url, data.width, data.height, { lineLength: data.lineLength, background: this.toHexColor(this.state.controls.bg) })
+      this.setImageUrl(url, data.width, data.height, { lineLength: data.lineLength, background: this.toHexColor(this.state.controls.bg) }, isPartial)
     } else {
       this.setState({ ui: uiState.ERROR, error: data.error });
     }
   }
 
-  setImageUrl(url, width, height, other) {
+  setImageUrl(url, width, height, other, isPartial) {
     const content = document.getElementById("content");
     const scale = Math.min(
       content.clientWidth / width,
@@ -374,10 +375,13 @@ class App extends React.Component {
 
     switch(this.state.ui) {
       case uiState.PROCESSING:
-        this.setState({ ui: uiState.VIEWING });
+        this.setState({ ui: isPartial ? uiState.VIEWING : uiState.VIEWING });
         break;
       case uiState.PENDING:
-        this.setState({ ui: uiState.VIEWING }, () => this.startBuild());
+        if (!isPartial) this.setState({ ui: uiState.VIEWING }, () => this.startBuild());
+        break;
+      case uiState.VIEWING:
+        // intermediate update while already viewing — just update url/stats
         break;
       default:
         break;

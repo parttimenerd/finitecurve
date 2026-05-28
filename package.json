@@ -7,11 +7,13 @@
     "@testing-library/jest-dom": "^5.11.5",
     "@testing-library/react": "^11.1.1",
     "@testing-library/user-event": "^12.2.0",
+    "ajv": "^8.20.0",
     "material-ui-color": "^0.4.8",
     "react": "^17.0.1",
     "react-dom": "^17.0.1",
     "react-map-interaction": "^2.0.0",
-    "react-scripts": "4.0.0",
+    "react-scripts": "^5.0.1",
+    "styled-components": "^6.4.2",
     "web-vitals": "^0.2.4"
   },
   "scripts": {
