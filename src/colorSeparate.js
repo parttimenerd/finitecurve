@@ -64,3 +64,78 @@ export function separateColors(rgbaData, width, height, threadColors) {
 
   return channels;
 }
+
+// 4-connected flood fill on a Uint8Array channel (255 = background/empty).
+// Returns an array of components, each as a Uint8Array with the same dimensions,
+// sorted largest-first by pixel count.
+export function splitComponents(channel, width, height) {
+  const size = width * height;
+  const visited = new Uint8Array(size); // 0=unvisited
+  const components = [];
+
+  for (let start = 0; start < size; start++) {
+    if (channel[start] === 255 || visited[start]) continue;
+
+    // BFS flood fill
+    const pixels = [];
+    const queue = [start];
+    visited[start] = 1;
+
+    let head = 0;
+    while (head < queue.length) {
+      const idx = queue[head++];
+      pixels.push(idx);
+
+      const x = idx % width;
+      const y = (idx / width) | 0;
+
+      // 4-connected neighbors
+      if (x > 0 && !visited[idx - 1] && channel[idx - 1] !== 255) {
+        visited[idx - 1] = 1; queue.push(idx - 1);
+      }
+      if (x < width - 1 && !visited[idx + 1] && channel[idx + 1] !== 255) {
+        visited[idx + 1] = 1; queue.push(idx + 1);
+      }
+      if (y > 0 && !visited[idx - width] && channel[idx - width] !== 255) {
+        visited[idx - width] = 1; queue.push(idx - width);
+      }
+      if (y < height - 1 && !visited[idx + width] && channel[idx + width] !== 255) {
+        visited[idx + width] = 1; queue.push(idx + width);
+      }
+    }
+
+    components.push(pixels);
+  }
+
+  // Sort largest component first
+  components.sort((a, b) => b.length - a.length);
+  return components;
+}
+
+// Given a channel and component pixel lists, merge components into at most `maxSplits`
+// separate Uint8Arrays. Largest components get their own slice; the rest are merged.
+export function splitChannelIntoSlices(channel, width, height, maxSplits) {
+  if (maxSplits <= 1) return [channel];
+
+  const components = splitComponents(channel, width, height);
+  if (components.length <= 1) return [channel];
+
+  const size = width * height;
+  const numSlices = Math.min(maxSplits, components.length);
+  const slices = Array.from({ length: numSlices }, () => new Uint8Array(size).fill(255));
+
+  // Each of the first (numSlices-1) largest components gets its own slice.
+  // All remaining components are merged into the last slice.
+  for (let s = 0; s < numSlices - 1; s++) {
+    for (const idx of components[s]) {
+      slices[s][idx] = channel[idx];
+    }
+  }
+  for (let c = numSlices - 1; c < components.length; c++) {
+    for (const idx of components[c]) {
+      slices[numSlices - 1][idx] = channel[idx];
+    }
+  }
+
+  return slices;
+}

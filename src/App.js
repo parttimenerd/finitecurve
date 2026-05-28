@@ -23,7 +23,7 @@ import exDog from './examples/dog.jpg';
 import exWorld from './examples/world.png';
 
 import OneLineClient from './OneLineClient.js';
-import { separateColors } from './colorSeparate.js';
+import { separateColors, splitChannelIntoSlices } from './colorSeparate.js';
 
 import './App.css';
 window.React = React;
@@ -130,7 +130,7 @@ async function decodeImageRGBA(arrayBuffer) {
   return { rgbaData: imageData.data, width: bitmap.width, height: bitmap.height };
 }
 
-async function suggestPalette(arrayBuffer, n) {
+async function suggestPalette(arrayBuffer, n, _numThreads) {
   const decoded = await decodeImageRGBA(arrayBuffer);
   if (!decoded) return null;
   const { rgbaData, width, height } = decoded;
@@ -192,7 +192,6 @@ async function suggestPalette(arrayBuffer, n) {
 const uiState = {
   SELECTING: 1,
   PROCESSING: 2,
-  PENDING: 3,
   VIEWING: 4,
   ERROR: 5,
 };
@@ -214,6 +213,7 @@ class App extends React.Component {
     this._lastDecodedImage = null;
     this._lastImageBuffer = null;
     this._lastColorPaths = null; // [{ hex, d }] — cached for live stroke-width updates
+    this._buildTimer = null;
     this.state = {
       lastDraw: 0,
       url: "data:",
@@ -243,6 +243,8 @@ class App extends React.Component {
       edgeStrength: 0,
       maxDensity: 10,
       multiColor: true,
+      numColors: 6,
+      numThreads: 6,
       fg: "#000000",
       colors: DEFAULT_COLORS.map(c => ({ ...c })),
       bg: "white",
@@ -263,8 +265,6 @@ class App extends React.Component {
           />);
       case uiState.PROCESSING:
         return <Spinner>Rendering...</Spinner>;
-      case uiState.PENDING:
-        return <Spinner>Finishing previous...</Spinner>;
       case uiState.ERROR:
         return (
           <ErrorMessage onAccept={() => this.openImageSelection()}>
@@ -274,7 +274,7 @@ class App extends React.Component {
       case uiState.VIEWING:
         return <span />;
       default:
-        alert("Developer messed up: " + this.state.ui);
+        return <span />;
     }
   }
 
@@ -288,8 +288,8 @@ class App extends React.Component {
 
     decodeImageRGBA(event.data).then(decoded => {
       this._lastDecodedImage = decoded;
-      const n = this.state.controls.colors.length;
-      return suggestPalette(event.data, n).then(palette => {
+      const { numColors } = this.state.controls;
+      return suggestPalette(event.data, numColors).then(palette => {
         if (palette) {
           this.setState(
             prev => ({ controls: { ...prev.controls, colors: palette } }),
@@ -302,43 +302,51 @@ class App extends React.Component {
     });
   }
 
-  triggerBuild(lastTime) {
-    if (lastTime < this.state.controls.timestamp) return;
-    this.startBuild();
-  }
-
   startBuild() {
-    switch (this.state.ui) {
-      case uiState.PROCESSING:
-      case uiState.PENDING:
-        this.setState({ ui: uiState.PENDING });
-        break;
-      case uiState.VIEWING:
-      case uiState.SELECTING:
-        this.setState({ ui: uiState.PROCESSING }, () => {
-          if (!this._lastDecodedImage) return;
-          const { colors, multiColor, fg, ...commonOptions } = this.state.controls;
-          const { rgbaData, width, height } = this._lastDecodedImage;
+    if (!this._lastDecodedImage) return;
+    this.setState({ ui: uiState.PROCESSING }, () => {
+      const { colors, multiColor, fg, numThreads, ...commonOptions } = this.state.controls;
+      const { rgbaData, width, height } = this._lastDecodedImage;
 
-          if (multiColor) {
-            const channels = separateColors(rgbaData, width, height, colors);
-            const threads = colors.map((c, i) => ({
-              hex: this.toHexColor(c.hex),
-              grayscaleChannel: channels[i],
-              width,
-              height,
-            }));
-            OneLineClient.buildMulti(threads, commonOptions);
-          } else {
-            // Single-color: send the full RGBA image, worker decodes it
-            OneLineClient.setImage(this._lastImageBuffer);
-            OneLineClient.build({ ...commonOptions, fg, bg: commonOptions.bg });
-          }
+      if (multiColor) {
+        const channels = separateColors(rgbaData, width, height, colors);
+
+        // Distribute extra thread budget across colors by size of their pixel region.
+        // Extra slots go to colors with the most pixels so disconnected regions get
+        // their own pass and avoid long connector lines.
+        const totalThreads = Math.max(numThreads, colors.length);
+        const extra = totalThreads - colors.length;
+
+        const pixelCounts = channels.map(ch => {
+          let count = 0;
+          for (let i = 0; i < ch.length; i++) if (ch[i] !== 255) count++;
+          return count;
         });
-        break;
-      default:
-        break;
-    }
+
+        const slots = new Array(colors.length).fill(1);
+        for (let e = 0; e < extra; e++) {
+          let best = 0, bestRatio = -1;
+          for (let k = 0; k < colors.length; k++) {
+            const ratio = pixelCounts[k] / slots[k];
+            if (ratio > bestRatio) { bestRatio = ratio; best = k; }
+          }
+          slots[best]++;
+        }
+
+        const threads = [];
+        for (let i = 0; i < colors.length; i++) {
+          const slices = splitChannelIntoSlices(channels[i], width, height, slots[i]);
+          for (const slice of slices) {
+            threads.push({ hex: this.toHexColor(colors[i].hex), grayscaleChannel: slice, width, height });
+          }
+        }
+
+        OneLineClient.buildMulti(threads, commonOptions);
+      } else {
+        OneLineClient.setImage(this._lastImageBuffer);
+        OneLineClient.build({ ...commonOptions, fg, bg: commonOptions.bg });
+      }
+    });
   }
 
   setStatus(string) {
@@ -346,19 +354,69 @@ class App extends React.Component {
   }
 
   changeControls(c) {
-    const time = Date.now();
-    const next = { ...this.state.controls, ...c, timestamp: time };
+    const next = { ...this.state.controls, ...c, timestamp: Date.now() };
+
+    // When numColors changes: resize colors array, clamp numThreads, re-suggest palette
+    if ('numColors' in c && c.numColors !== this.state.controls.numColors) {
+      const n = c.numColors;
+      const cur = next.colors;
+      if (cur.length > n) {
+        next.colors = cur.slice(0, n);
+      } else if (cur.length < n) {
+        const extra = Array.from({ length: n - cur.length }, () => ({ hex: '#888888' }));
+        next.colors = [...cur, ...extra];
+      }
+      if (next.numThreads < n) next.numThreads = n;
+
+      this.setState({ controls: next }, () => {
+        if (this._lastImageBuffer) {
+          suggestPalette(this._lastImageBuffer, n).then(palette => {
+            if (palette) this.changeControls({ colors: palette });
+          });
+        }
+      });
+      return;
+    }
+
+    // When numThreads changes: auto-suggest so colors fill the new thread budget
+    if ('numThreads' in c && c.numThreads !== this.state.controls.numThreads) {
+      this.setState({ controls: next }, () => {
+        if (this._lastImageBuffer) {
+          const { numColors } = this.state.controls;
+          suggestPalette(this._lastImageBuffer, numColors).then(palette => {
+            if (palette) {
+              this.setState(
+                prev => ({ controls: { ...prev.controls, colors: palette } }),
+                () => this.scheduleBuild(150)
+              );
+            } else {
+              this.scheduleBuild(150);
+            }
+          });
+        }
+      });
+      return;
+    }
+
     this.setState({ controls: next });
 
-    // Live stroke-width: recompose SVG from cached paths without re-rendering
+    // Live stroke-width: recompose SVG instantly from cached paths — no rebuild needed
     if ('lineWidth' in c && this._lastColorPaths && this.state.ui === uiState.VIEWING) {
       this.recomposeSVG(c.lineWidth);
-      return; // don't trigger a full rebuild for stroke-width changes
+      return;
     }
 
     if (this.state.ui !== uiState.SELECTING) {
-      setTimeout(() => this.triggerBuild(time), 1000);
+      this.scheduleBuild(200);
     }
+  }
+
+  scheduleBuild(delayMs) {
+    if (this._buildTimer) clearTimeout(this._buildTimer);
+    this._buildTimer = setTimeout(() => {
+      this._buildTimer = null;
+      this.startBuild();
+    }, delayMs);
   }
 
   recomposeSVG(lineWidth) {
@@ -376,8 +434,8 @@ class App extends React.Component {
 
   autoSuggestPalette() {
     if (!this._lastImageBuffer) return;
-    const n = this.state.controls.colors.length;
-    suggestPalette(this._lastImageBuffer, n).then(palette => {
+    const { numColors } = this.state.controls;
+    suggestPalette(this._lastImageBuffer, numColors).then(palette => {
       if (palette) this.changeControls({ colors: palette });
     });
   }
@@ -464,20 +522,17 @@ class App extends React.Component {
       let svg = data.result;
 
       if (!this.state.controls.multiColor) {
-        // Single-color: inject fg, cache as single-path
         const fgHex = this.toHexColor(this.state.controls.fg);
-        svg = svg.replace("stroke='black'", `stroke='${fgHex}'`);
-        // Extract and cache for live stroke-width
-        const m = svg.match(/d='([\s\S]*?)'\s*\/>/);
-        if (m) this._lastColorPaths = [{ hex: fgHex, d: m[1] }];
+        svg = svg.replace(/stroke='black'/, `stroke='${fgHex}'`);
+        const m = svg.match(/\bd='([\s\S]*?)'\s*\/>/);
+        if (m) this._lastColorPaths = [{ hex: fgHex, d: m[1].trim() }];
       } else {
-        // Multi-color: SVG already has correct colors; extract paths for caching
-        const pathRe = /stroke='([^']+)'[^d]*d='([\s\S]*?)'\s*\/>/g;
+        const pathRe = /stroke='([^']+)'[^/]*?d='([\s\S]*?)'\s*\/>/g;
         const paths = [];
         let pm;
         // eslint-disable-next-line no-cond-assign
         while ((pm = pathRe.exec(svg)) !== null) {
-          paths.push({ hex: pm[1], d: pm[2] });
+          paths.push({ hex: pm[1], d: pm[2].trim() });
         }
         if (paths.length > 0) this._lastColorPaths = paths;
       }
@@ -504,17 +559,10 @@ class App extends React.Component {
     });
     this.setStatus("");
 
-    switch (this.state.ui) {
-      case uiState.PROCESSING:
-        this.setState({ ui: uiState.VIEWING });
-        break;
-      case uiState.PENDING:
-        if (!isPartial) this.setState({ ui: uiState.VIEWING }, () => this.startBuild());
-        break;
-      case uiState.VIEWING:
-        break;
-      default:
-        break;
+    if (!isPartial) {
+      this.setState({ ui: uiState.VIEWING });
+    } else if (this.state.ui !== uiState.PROCESSING) {
+      this.setState({ ui: uiState.VIEWING });
     }
   }
 }
@@ -580,9 +628,11 @@ function hexLuminance(hex) {
   return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
 }
 
-function ColorPaletteEditor({ colors, onChange, onAutoSuggest }) {
+function ColorPaletteEditor({ colors, numThreads, onChange, onAutoSuggest, onNumThreadsChange }) {
   const MAX_COLORS = 12;
   const MIN_COLORS = 1;
+  const dragIdxRef = React.useRef(null);
+  const [dragOver, setDragOver] = React.useState(null);
 
   function addColor() {
     if (colors.length >= MAX_COLORS) return;
@@ -607,23 +657,58 @@ function ColorPaletteEditor({ colors, onChange, onAutoSuggest }) {
     onChange(next);
   }
 
-  function moveColor(index, dir) {
-    const next = [...colors];
-    const target = index + dir;
-    if (target < 0 || target >= next.length) return;
-    [next[index], next[target]] = [next[target], next[index]];
-    onChange(next);
-  }
-
   function sortByLuminance() {
     onChange([...colors].sort((a, b) => hexLuminance(a.hex) - hexLuminance(b.hex)));
   }
+
+  function handleDragStart(e, i) {
+    dragIdxRef.current = i;
+    e.dataTransfer.effectAllowed = 'move';
+  }
+
+  function handleDragOver(e, i) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setDragOver(i);
+  }
+
+  function handleDrop(e, i) {
+    e.preventDefault();
+    const from = dragIdxRef.current;
+    if (from === null || from === i) { setDragOver(null); return; }
+    const next = [...colors];
+    const [moved] = next.splice(from, 1);
+    next.splice(i, 0, moved);
+    dragIdxRef.current = null;
+    setDragOver(null);
+    onChange(next);
+  }
+
+  function handleDragEnd() {
+    dragIdxRef.current = null;
+    setDragOver(null);
+  }
+
+  const extraThreads = numThreads - colors.length;
 
   return (
     <div>
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 4 }}>
         {colors.map((c, i) => (
-          <div key={i} style={{ position: 'relative', display: 'inline-flex', flexDirection: 'column', alignItems: 'center' }}>
+          <div
+            key={i}
+            draggable
+            onDragStart={e => handleDragStart(e, i)}
+            onDragOver={e => handleDragOver(e, i)}
+            onDrop={e => handleDrop(e, i)}
+            onDragEnd={handleDragEnd}
+            style={{
+              position: 'relative', display: 'inline-flex', flexDirection: 'column',
+              alignItems: 'center', cursor: 'grab',
+              outline: dragOver === i ? '2px solid #1976d2' : 'none',
+              borderRadius: 4,
+            }}
+          >
             <div style={{ position: 'relative', display: 'inline-flex' }}>
               <ColorPicker
                 value={c.hex}
@@ -656,33 +741,18 @@ function ColorPaletteEditor({ colors, onChange, onAutoSuggest }) {
                 </Tooltip>
               )}
             </div>
-            {colors.length > 1 && (
-              <div style={{ display: 'flex', marginTop: 1 }}>
-                <span
-                  onClick={() => moveColor(i, -1)}
-                  style={{
-                    cursor: i === 0 ? 'default' : 'pointer',
-                    opacity: i === 0 ? 0.2 : 0.7,
-                    fontSize: 9, userSelect: 'none', lineHeight: 1, padding: '0 1px',
-                  }}
-                >◀</span>
-                <span
-                  onClick={() => moveColor(i, 1)}
-                  style={{
-                    cursor: i === colors.length - 1 ? 'default' : 'pointer',
-                    opacity: i === colors.length - 1 ? 0.2 : 0.7,
-                    fontSize: 9, userSelect: 'none', lineHeight: 1, padding: '0 1px',
-                  }}
-                >▶</span>
-              </div>
-            )}
           </div>
         ))}
         {colors.length < MAX_COLORS && (
           <Button onClick={addColor} style={{ minWidth: 24, padding: '2px 4px', fontSize: 16, lineHeight: 1, alignSelf: 'flex-start' }}>+</Button>
         )}
       </div>
-      <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+      {extraThreads > 0 && (
+        <Typography variant="caption" style={{ display: 'block', marginTop: 4, color: '#888' }}>
+          +{extraThreads} extra {extraThreads === 1 ? 'pass' : 'passes'} — largest disconnected regions rendered separately
+        </Typography>
+      )}
+      <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
         <Button size="small" onClick={onAutoSuggest} style={{ fontSize: 10, padding: '2px 6px' }}>
           Auto-suggest
         </Button>
@@ -726,13 +796,26 @@ function AppDrawer(props) {
         <ListItem style={{ marginTop: -10 }}>
           <ParameterCheckbox value={props.multiColor} onChange={(e, c) => props.onChange({ multiColor: c })} title="Multi-color" tooltip="Separate image into color regions, one thread per color" />
         </ListItem>
+        {props.multiColor && (
+          <>
+            <ListItem>
+              <ParameterSlider min={1} max={12} value={props.numColors} onChange={(e, c) => props.onChange({ numColors: c })} step={1} title="Colors" tooltip="Number of distinct thread colors — auto-suggested from image" />
+            </ListItem>
+            <ListItem>
+              <ParameterSlider min={props.numColors} max={Math.max(props.numColors * 4, 12)} value={props.numThreads} onChange={(e, c) => props.onChange({ numThreads: c })} step={1} title="Threads" tooltip="Total passes — extra passes split a color's disconnected regions to avoid long connector lines" />
+            </ListItem>
+          </>
+        )}
         <ListItem style={{ marginTop: -10 }}>
           <div style={{ width: '100%' }}>
             {props.multiColor ? (
               <>
-                <Typography variant="caption" style={{ display: 'block', marginBottom: 4 }}>Thread colors</Typography>
+                <Typography variant="caption" style={{ display: 'block', marginBottom: 2 }}>
+                  Thread colors (drag to reorder)
+                </Typography>
                 <ColorPaletteEditor
                   colors={props.colors}
+                  numThreads={props.numThreads}
                   onChange={colors => props.onChange({ colors })}
                   onAutoSuggest={props.onAutoSuggest}
                 />
