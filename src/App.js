@@ -208,7 +208,7 @@ function buildSegmentationPreview(rgbaData, width, height, colors, controls) {
   return canvas.toDataURL('image/png');
 }
 
-async function suggestPalette(arrayBuffer, n, bgColor) {
+async function suggestPalette(arrayBuffer, n, bgColor, vibrancy = 50) {
   const decoded = await decodeImageRGBA(arrayBuffer);
   if (!decoded) return null;
   const { rgbaData, width, height } = decoded;
@@ -290,11 +290,33 @@ async function suggestPalette(arrayBuffer, n, bgColor) {
     ];
   }
 
-  const rgbCentroids = centroids.map(([L, a, b]) => labToRgb(L, a, b));
+  const rgbCentroids = centroids.map(([L, a, b]) => {
+    // vibrancy 0..50 = scale 0..1 (desaturate), 50..100 = scale 1..2.5 (boost)
+    const scale = vibrancy <= 50 ? vibrancy / 50 : 1 + (vibrancy - 50) / 50 * 1.5;
+    return labToRgb(L, a * scale, b * scale);
+  });
   const dominantRGB = rgbCentroids[dominantIdx];
 
   // Sort by luminance darkest first
   rgbCentroids.sort((a, b) => (0.299*a[0]+0.587*a[1]+0.114*a[2]) - (0.299*b[0]+0.587*b[1]+0.114*b[2]));
+
+  // Enforce minimum perceptual distance: merge colors that are too similar
+  // by replacing the smaller cluster with the midpoint, then re-sort.
+  const MIN_LAB_DIST_SQ = 20 * 20; // ΔE ≈ 20 — clearly distinguishable colors
+  const labFinal = rgbCentroids.map(([r, g, b]) => rgbToLab(r, g, b));
+  for (let i = 0; i < labFinal.length; i++) {
+    for (let j = i + 1; j < labFinal.length; j++) {
+      if (distSq(labFinal[i], labFinal[j]) < MIN_LAB_DIST_SQ) {
+        // Push j further away from i along the L axis
+        const dL = labFinal[j][0] - labFinal[i][0];
+        const push = dL >= 0 ? 20 : -20;
+        labFinal[j][0] = Math.min(100, Math.max(0, labFinal[j][0] + push));
+        rgbCentroids[j] = labToRgb(...labFinal[j]);
+      }
+    }
+  }
+  rgbCentroids.sort((a, b) => (0.299*a[0]+0.587*a[1]+0.114*a[2]) - (0.299*b[0]+0.587*b[1]+0.114*b[2]));
+
   const palette = rgbCentroids.map(([r, g, b]) => ({ hex: rgbToHex(r, g, b) }));
 
   const domHex = rgbToHex(...dominantRGB);
@@ -370,6 +392,7 @@ class App extends React.Component {
       maxDensity: 10,
       multiColor: true,
       numColors: 6,
+      vibrancy: 50,
       numThreads: 12,
       fg: "#000000",
       colors: DEFAULT_COLORS.map(c => ({ ...c })),
@@ -420,7 +443,7 @@ class App extends React.Component {
     decodeImageRGBA(event.data).then(decoded => {
       this._lastDecodedImage = decoded;
       const { numColors } = this.state.controls;
-      return suggestPalette(event.data, numColors, this.state.controls.bg).then(palette => {
+      return suggestPalette(event.data, numColors, this.state.controls.bg, this.state.controls.vibrancy).then(palette => {
         if (palette) {
           this.setState(
             prev => ({ controls: { ...prev.controls, colors: palette } }),
@@ -570,9 +593,10 @@ class App extends React.Component {
       this.setState({ ui: uiState.VIEWING });
     }
 
-    // When numColors changes: resize colors array, clamp numThreads, re-suggest palette
-    if ('numColors' in c && c.numColors !== this.state.controls.numColors) {
-      const n = c.numColors;
+    // When numColors or vibrancy changes: resize colors array, clamp numThreads, re-suggest palette
+    if (('numColors' in c && c.numColors !== this.state.controls.numColors) ||
+        ('vibrancy' in c && c.vibrancy !== this.state.controls.vibrancy)) {
+      const n = next.numColors;
       const cur = next.colors;
       if (cur.length > n) {
         next.colors = cur.slice(0, n);
@@ -584,7 +608,7 @@ class App extends React.Component {
 
       this.setState({ controls: next }, () => {
         if (this._lastImageBuffer) {
-          suggestPalette(this._lastImageBuffer, n, next.bg).then(palette => {
+          suggestPalette(this._lastImageBuffer, n, next.bg, next.vibrancy).then(palette => {
             if (palette) this.changeControls({ colors: palette });
           });
         }
@@ -597,7 +621,7 @@ class App extends React.Component {
       this.setState({ controls: next }, () => {
         if (this._lastImageBuffer) {
           const { numColors } = this.state.controls;
-          suggestPalette(this._lastImageBuffer, numColors, this.state.controls.bg).then(palette => {
+          suggestPalette(this._lastImageBuffer, numColors, this.state.controls.bg, this.state.controls.vibrancy).then(palette => {
             if (palette) {
               this.setState(
                 prev => ({ controls: { ...prev.controls, colors: palette } }),
@@ -672,8 +696,8 @@ class App extends React.Component {
 
   autoSuggestPalette() {
     if (!this._lastImageBuffer) return;
-    const { numColors, bg } = this.state.controls;
-    suggestPalette(this._lastImageBuffer, numColors, bg).then(palette => {
+    const { numColors, bg, vibrancy } = this.state.controls;
+    suggestPalette(this._lastImageBuffer, numColors, bg, vibrancy).then(palette => {
       if (palette) this.changeControls({ colors: palette });
     });
   }
@@ -1146,6 +1170,7 @@ function AppDrawer(props) {
           <>
             <ListItem>
               <ParameterSlider min={1} max={12} value={props.numColors} onChange={(e, c) => props.onChange({ numColors: c })} step={1} title="Colors" tooltip="Number of distinct thread colors — auto-suggested from image" />
+              <ParameterSlider min={0} max={100} value={props.vibrancy} onChange={(e, c) => props.onChange({ vibrancy: c })} title="Vibrancy" tooltip="How saturated the auto-suggested colors are (50 = natural, higher = more vivid)" />
             </ListItem>
             <ListItem>
               <ParameterSlider min={props.numColors} max={Math.max(props.numColors * 4, 50)} value={props.numThreads} onChange={(e, c) => props.onChange({ numThreads: c })} step={1} title="Threads" tooltip="Total passes — extra passes split a color's disconnected regions to avoid long connector lines" />
