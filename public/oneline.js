@@ -1023,43 +1023,83 @@ function makeConfig(w, h, opts) {
 
 let imageBuffer = null; // ArrayBuffer
 
+let grayscaleBuffer = null; // set by setGrayscale, cleared by setImage
+
 function setImage(data) {
   imageBuffer = data;
+  grayscaleBuffer = null;
+}
+
+function setGrayscale(data, width, height) {
+  grayscaleBuffer = { data, width, height };
+  imageBuffer = null;
 }
 
 async function build(options, seq) {
   const wh = Math.round(options.resolution * 150);
   const maxDim = wh <= 0 ? 50 : wh;
 
-  if (!imageBuffer || imageBuffer.byteLength === 0) {
-    return { success: false, error: 'No image data received.' };
-  }
+  let img;
+  if (grayscaleBuffer) {
+    // Pre-decoded grayscale path (used by multi-color builds)
+    const { data, width, height } = grayscaleBuffer;
+    const scale = Math.min(maxDim / width, maxDim / height, 1);
+    const dstW = Math.max(1, Math.round(width * scale));
+    const dstH = Math.max(1, Math.round(height * scale));
+    img = new Image(dstW, dstH);
+    const xScale = width / dstW;
+    const yScale = height / dstH;
+    const boxW = Math.max(1, Math.round(xScale));
+    const boxH = Math.max(1, Math.round(yScale));
+    for (let y = 0; y < dstH; y++) {
+      for (let x = 0; x < dstW; x++) {
+        let n = 0, s = 0;
+        const py0 = Math.floor(y * yScale);
+        const px0 = Math.floor(x * xScale);
+        for (let yd = 0; yd < boxH; yd++) {
+          const py = py0 + yd;
+          if (py >= height) break;
+          for (let xd = 0; xd < boxW; xd++) {
+            const px = px0 + xd;
+            if (px >= width) break;
+            s += data[py * width + px];
+            n++;
+          }
+        }
+        const v = n === 0 ? 255 : Math.round(s / n);
+        img.pixels[y * dstW + x] = options.invert ? 255 - v : v;
+      }
+    }
+  } else {
+    // RGBA decode path (single-color builds)
+    if (!imageBuffer || imageBuffer.byteLength === 0) {
+      return { success: false, error: 'No image data received.' };
+    }
 
-  // Decode image to RGBA using createImageBitmap (available in Worker)
-  let bitmap;
-  try {
-    const blob = new Blob([imageBuffer]);
-    bitmap = await createImageBitmap(blob);
-  } catch (e) {
-    return { success: false, error: 'Failed to decode image. Is it a valid jpg or png file?' };
-  }
+    let bitmap;
+    try {
+      const blob = new Blob([imageBuffer]);
+      bitmap = await createImageBitmap(blob);
+    } catch (e) {
+      return { success: false, error: 'Failed to decode image. Is it a valid jpg or png file?' };
+    }
 
-  // Draw to OffscreenCanvas to get RGBA pixels
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(bitmap, 0, 0);
-  const srcW = bitmap.width, srcH = bitmap.height;
-  if (!srcW || !srcH) {
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0);
+    const srcW = bitmap.width, srcH = bitmap.height;
+    if (!srcW || !srcH) {
+      bitmap.close();
+      return { success: false, error: 'Failed to decode image dimensions.' };
+    }
+    const imageData = ctx.getImageData(0, 0, srcW, srcH);
     bitmap.close();
-    return { success: false, error: 'Failed to decode image dimensions.' };
-  }
-  const imageData = ctx.getImageData(0, 0, srcW, srcH);
-  bitmap.close();
 
-  const img = Image.loadFromRGBA(
-    imageData.data, srcW, srcH,
-    maxDim, maxDim, 1, options.invert
-  );
+    img = Image.loadFromRGBA(
+      imageData.data, srcW, srcH,
+      maxDim, maxDim, 1, options.invert
+    );
+  }
 
   img.adjustContrast(options.contrast, options.whiteCutoff, options.invert);
 
@@ -1093,6 +1133,9 @@ addEventListener('message', async (event) => {
   switch (msg.type) {
     case 'setImage':
       setImage(msg.data);
+      break;
+    case 'setGrayscale':
+      setGrayscale(msg.data, msg.width, msg.height);
       break;
     case 'build': {
       const options = JSON.parse(msg.options);

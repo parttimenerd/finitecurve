@@ -1,7 +1,5 @@
 import React from 'react';
-import Box from '@material-ui/core/Box';
 import Button from '@material-ui/core/Button';
-import Container from "@material-ui/core/Container";
 import Checkbox from "@material-ui/core/Checkbox";
 import Divider from "@material-ui/core/Divider";
 import Drawer from "@material-ui/core/Drawer";
@@ -25,19 +23,16 @@ import exDog from './examples/dog.jpg';
 import exWorld from './examples/world.png';
 
 import OneLineClient from './OneLineClient.js';
+import { separateColors } from './colorSeparate.js';
 
 import './App.css';
 window.React = React;
 
-const drawerWidth = 200;
+const drawerWidth = 220;
 
 const styles = {
   root: {
     display: 'flex',
-    height: '100%',
-  },
-  fullscreen: {
-    width: '100%',
     height: '100%',
   },
   drawer: {
@@ -48,18 +43,15 @@ const styles = {
     width: drawerWidth,
     "overflow-x": "hidden",
   },
-  // necessary for content to be below app bar
-  // toolbar: theme.mixins.toolbar,
   content: {
     flexGrow: 1,
     position: "relative",
     overflow: "hidden",
     top: 0,
-    bottom:0,
+    bottom: 0,
     left: 0,
     right: 0,
   },
-
   lowButton: {
     width: drawerWidth - 40,
     marginLeft: 20,
@@ -67,7 +59,6 @@ const styles = {
     marginTop: 20,
     marginBottom: 0,
   },
-
   highButton: {
     width: drawerWidth - 40,
     marginLeft: 20,
@@ -75,7 +66,6 @@ const styles = {
     marginTop: 0,
     marginBottom: 20,
   },
-
   lowHighButton: {
     width: drawerWidth - 40,
     marginLeft: 20,
@@ -83,7 +73,6 @@ const styles = {
     marginTop: 20,
     marginBottom: 20,
   },
-
   imageSelector: {
     display: "inline-block",
     padding: "25px",
@@ -91,7 +80,6 @@ const styles = {
     "border-radius": "25px",
     backgroundColor: "#fff",
   },
-
   errorBox: {
     display: "inline-block",
     padding: "25px",
@@ -99,18 +87,15 @@ const styles = {
     "border-radius": "25px",
     backgroundColor: "#fff",
   },
-
   exampleBox: {
     width: "80px",
     height: "80px",
   },
-
   toast: {
     position: "absolute",
     top: "0.5em",
     left: "0.5em",
   },
-
   stats: {
     position: "absolute",
     bottom: "0.5em",
@@ -122,8 +107,88 @@ const styles = {
 
 const madeStyles = makeStyles(styles);
 
-let handler = undefined;
-let setMapSize = undefined;
+// ─── Palette utilities ────────────────────────────────────────────────────────
+
+function rgbToHSL(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return [h * 60, s, l];
+}
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
+}
+
+async function decodeImageRGBA(arrayBuffer) {
+  const blob = new Blob([arrayBuffer]);
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(blob);
+  } catch (e) {
+    return null;
+  }
+  const canvas = document.createElement('canvas');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bitmap, 0, 0);
+  const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+  return { rgbaData: imageData.data, width: bitmap.width, height: bitmap.height };
+}
+
+async function suggestPalette(arrayBuffer, n) {
+  const decoded = await decodeImageRGBA(arrayBuffer);
+  if (!decoded) return null;
+  const { rgbaData, width, height } = decoded;
+
+  const samples = [];
+  const stride = 8; // sample every 8th pixel
+  for (let i = 0; i < width * height; i += stride) {
+    const a = rgbaData[i * 4 + 3];
+    if (a < 128) continue;
+    samples.push([rgbaData[i * 4], rgbaData[i * 4 + 1], rgbaData[i * 4 + 2]]);
+  }
+  if (samples.length === 0) return null;
+
+  // Initialise centroids spread evenly over luminance-sorted samples
+  const sorted = [...samples].sort(
+    (a, b) => (0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2]) - (0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2])
+  );
+  let centroids = Array.from({ length: n }, (_, i) =>
+    [...sorted[Math.floor(i * sorted.length / n)]]
+  );
+
+  for (let iter = 0; iter < 8; iter++) {
+    const sums = Array.from({ length: n }, () => [0, 0, 0, 0]);
+    for (const [r, g, b] of samples) {
+      let best = 0, bestDist = Infinity;
+      for (let k = 0; k < n; k++) {
+        const dr = r - centroids[k][0], dg = g - centroids[k][1], db = b - centroids[k][2];
+        const d = dr * dr + dg * dg + db * db;
+        if (d < bestDist) { bestDist = d; best = k; }
+      }
+      sums[best][0] += r; sums[best][1] += g; sums[best][2] += b; sums[best][3]++;
+    }
+    const prev = centroids;
+    centroids = sums.map(([r, g, b, c], i) =>
+      c > 0 ? [r / c, g / c, b / c] : prev[i]
+    );
+  }
+
+  // Sort by hue for a rainbow-ish ordering
+  centroids.sort((a, b) => rgbToHSL(...a)[0] - rgbToHSL(...b)[0]);
+  return centroids.map(([r, g, b]) => ({ hex: rgbToHex(r, g, b) }));
+}
+
+// ─── State ────────────────────────────────────────────────────────────────────
 
 const uiState = {
   SELECTING: 1,
@@ -133,10 +198,22 @@ const uiState = {
   ERROR: 5,
 };
 
+const DEFAULT_COLORS = [
+  { hex: '#1a1a2e' },
+  { hex: '#16213e' },
+  { hex: '#0f3460' },
+  { hex: '#e94560' },
+  { hex: '#f5a623' },
+  { hex: '#d4d4d4' },
+];
+
+// ─── App ──────────────────────────────────────────────────────────────────────
 
 class App extends React.Component {
   constructor(props) {
     super(props);
+    this._lastDecodedImage = null;
+    this._lastImageBuffer = null;
     this.state = {
       lastDraw: 0,
       url: "data:",
@@ -145,16 +222,9 @@ class App extends React.Component {
       height: 0,
       ui: uiState.SELECTING,
       status: "",
-      map: {
-        scale: 1,
-        translation: {
-          x: 0,
-          y: 0,
-        }
-      },
+      map: { scale: 1, translation: { x: 0, y: 0 } },
       controls: this.getDefaultControls(),
     };
-
     OneLineClient.onResult = d => this.processResult(this, d);
   }
 
@@ -163,16 +233,16 @@ class App extends React.Component {
   }
 
   getDefaultControls() {
-      return {
-        timestamp: Date.now(),
-        resolution: 30,
-        lineWidth: 4,
-        contrast: 50,
-        whiteCutoff: 240,
-        invert: false,
-        fg: "black",
-        bg: "white",
-      };
+    return {
+      timestamp: Date.now(),
+      resolution: 30,
+      lineWidth: 4,
+      contrast: 50,
+      whiteCutoff: 240,
+      invert: false,
+      colors: DEFAULT_COLORS.map(c => ({ ...c })),
+      bg: "white",
+    };
   }
 
   openFeedback() {
@@ -180,7 +250,7 @@ class App extends React.Component {
   }
 
   getUiStateElement() {
-    switch(this.state.ui) {
+    switch (this.state.ui) {
       case uiState.SELECTING:
         return (
           <ImageSelector
@@ -188,13 +258,9 @@ class App extends React.Component {
             onImageSelected={e => this.onImageSelected(e)}
           />);
       case uiState.PROCESSING:
-        return (
-          <Spinner>Rendering...</Spinner>
-        );
+        return <Spinner>Rendering...</Spinner>;
       case uiState.PENDING:
-        return (
-          <Spinner>Finishing previous...</Spinner>
-        );
+        return <Spinner>Finishing previous...</Spinner>;
       case uiState.ERROR:
         return (
           <ErrorMessage onAccept={() => this.openImageSelection()}>
@@ -202,7 +268,7 @@ class App extends React.Component {
           </ErrorMessage>
         );
       case uiState.VIEWING:
-        return (<span />);
+        return <span />;
       default:
         alert("Developer messed up: " + this.state.ui);
     }
@@ -213,9 +279,23 @@ class App extends React.Component {
   }
 
   onImageSelected(event) {
-    OneLineClient.setImage(event.data);
+    this._lastImageBuffer = event.data;
     this.setStatus("Processing...");
-    this.startBuild();
+
+    decodeImageRGBA(event.data).then(decoded => {
+      this._lastDecodedImage = decoded;
+      const n = this.state.controls.colors.length;
+      return suggestPalette(event.data, n).then(palette => {
+        if (palette) {
+          this.setState(
+            prev => ({ controls: { ...prev.controls, colors: palette } }),
+            () => this.startBuild()
+          );
+        } else {
+          this.startBuild();
+        }
+      });
+    });
   }
 
   triggerBuild(lastTime) {
@@ -224,14 +304,28 @@ class App extends React.Component {
   }
 
   startBuild() {
-    switch(this.state.ui) {
+    switch (this.state.ui) {
       case uiState.PROCESSING:
       case uiState.PENDING:
-        this.setState({ui: uiState.PENDING });
+        this.setState({ ui: uiState.PENDING });
         break;
       case uiState.VIEWING:
       case uiState.SELECTING:
-        this.setState({ ui: uiState.PROCESSING }, () => OneLineClient.build(this.state.controls));
+        this.setState({ ui: uiState.PROCESSING }, () => {
+          if (!this._lastDecodedImage) return;
+          const { colors, ...commonOptions } = this.state.controls;
+          const { rgbaData, width, height } = this._lastDecodedImage;
+          const channels = separateColors(rgbaData, width, height, colors);
+          const threads = colors.map((c, i) => ({
+            hex: this.toHexColor(c.hex),
+            grayscaleChannel: channels[i],
+            width,
+            height,
+          }));
+          OneLineClient.buildMulti(threads, commonOptions);
+        });
+        break;
+      default:
         break;
     }
   }
@@ -253,8 +347,16 @@ class App extends React.Component {
     this.setState({ ui: uiState.SELECTING });
   }
 
+  autoSuggestPalette() {
+    if (!this._lastImageBuffer) return;
+    const n = this.state.controls.colors.length;
+    suggestPalette(this._lastImageBuffer, n).then(palette => {
+      if (palette) this.changeControls({ colors: palette });
+    });
+  }
+
   downloadFile(name, url) {
-    var element = document.createElement("a");
+    const element = document.createElement("a");
     element.setAttribute("href", url);
     element.setAttribute("download", name);
     document.body.appendChild(element);
@@ -263,54 +365,52 @@ class App extends React.Component {
   }
 
   getPngUrl() {
-    var canvas = document.createElement("canvas");
-    var img = document.createElement("img");
+    const canvas = document.createElement("canvas");
+    const img = document.createElement("img");
     img.src = this.state.url;
     canvas.width = img.width = this.state.width;
     canvas.height = img.height = this.state.height;
-
     document.body.appendChild(canvas);
     document.body.appendChild(img);
-    let ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d");
     ctx.beginPath();
     ctx.rect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = this.toHexColor(this.state.controls.bg);
     ctx.fill();
     ctx.drawImage(img, 0, 0);
-    let url = canvas.toDataURL('image/png');
+    const url = canvas.toDataURL('image/png');
     document.body.removeChild(img);
     document.body.removeChild(canvas);
     return url;
   }
 
   toHexColor(c) {
-    if (typeof c === "string") {
-      return c;
-    }
+    if (typeof c === "string") return c;
     return "#" + c.hex;
   }
 
   render() {
     const { classes } = this.props;
-
     return (
       <div className={classes.root}>
-        <AppDrawer {...this.state.controls}
-            onChange={ c => this.changeControls(c) }
-            onNewImage={() => this.openImageSelection()}
-            onDownloadSVG={() => this.downloadFile("finitecurve.svg", this.state.url)}
-            onDownloadPNG={() => this.downloadFile("finitecurve.png", this.getPngUrl())}
-            onResetParams={() => this.changeControls(this.getDefaultControls())}
-            onFeedback={() => this.openFeedback()}
-            canSelect={this.state.ui !== uiState.SELECTING}
-            canDownload={this.state.ui === uiState.VIEWING}
-          />
-        <div className={classes.content} id="content" style={{backgroundColor: this.state.background}}>
+        <AppDrawer
+          {...this.state.controls}
+          onChange={c => this.changeControls(c)}
+          onNewImage={() => this.openImageSelection()}
+          onDownloadSVG={() => this.downloadFile("finitecurve.svg", this.state.url)}
+          onDownloadPNG={() => this.downloadFile("finitecurve.png", this.getPngUrl())}
+          onResetParams={() => this.changeControls(this.getDefaultControls())}
+          onFeedback={() => this.openFeedback()}
+          onAutoSuggest={() => this.autoSuggestPalette()}
+          canSelect={this.state.ui !== uiState.SELECTING}
+          canDownload={this.state.ui === uiState.VIEWING}
+        />
+        <div className={classes.content} id="content" style={{ backgroundColor: this.state.background }}>
           <Typography className={classes.toast}>{this.getToastMessage()}</Typography>
           <Typography className={classes.stats}>{this.getStats()}</Typography>
           {this.getUiStateElement(this.state.ui)}
-          <MapInteractionCSS value={this.state.map} onChange={(c) => this.setState({map: c})}>
-            <img src={this.state.url} width={this.state.width + "px"} height={this.state.height + "px"}/>
+          <MapInteractionCSS value={this.state.map} onChange={(c) => this.setState({ map: c })}>
+            <img src={this.state.url} width={this.state.width + "px"} height={this.state.height + "px"} alt="" />
           </MapInteractionCSS>
         </div>
       </div>
@@ -319,35 +419,26 @@ class App extends React.Component {
 
   getToastMessage() {
     if (this.state.ui !== uiState.VIEWING) return "";
-
     if (this.state.map.translation.x === 0 && this.state.map.translation.y === 0) {
       return "Pan/zoom to view details!";
-    } else {
-      return "";
     }
+    return "";
   }
 
   getStats() {
     if (this.state.ui !== uiState.VIEWING) return "";
-    let dist = typeof(this.state.lineLength) === "number" ? this.state.lineLength.toFixed(0) : "?"
+    const dist = typeof (this.state.lineLength) === "number" ? this.state.lineLength.toFixed(0) : "?";
     return "Image: " + this.state.width + "x" + this.state.height + "px. Line: " + dist + "px";
-  }
-
-  swapForeground(svg, c) {
-    const rep = "black";
-    let index = svg.indexOf(rep);
-    if (index === -1) {
-      console.error("Oof, no color");
-      return svg;
-    }
-    return svg.substring(0, index) + c + svg.substring(index+rep.length);
   }
 
   processResult(self, data) {
     if (data.success) {
       const isPartial = data.type === 'partial';
-      let url = "data:image/svg+xml;charset=utf-8;base64," + btoa(this.swapForeground(data.result, this.toHexColor(this.state.controls.fg)));
-      this.setImageUrl(url, data.width, data.height, { lineLength: data.lineLength, background: this.toHexColor(this.state.controls.bg) }, isPartial)
+      const url = "data:image/svg+xml;charset=utf-8;base64," + btoa(data.result);
+      this.setImageUrl(url, data.width, data.height, {
+        lineLength: data.lineLength,
+        background: this.toHexColor(this.state.controls.bg),
+      }, isPartial);
     } else {
       this.setState({ ui: uiState.ERROR, error: data.error });
     }
@@ -359,29 +450,20 @@ class App extends React.Component {
       content.clientWidth / width,
       content.clientHeight / height);
     this.setState({
-      url: url,
-      width: width,
-      height: height,
-      map: {
-        scale: scale,
-        translation: {
-          x: 0,
-          y: 0,
-        },
-      },
-      ...other
+      url, width, height,
+      map: { scale, translation: { x: 0, y: 0 } },
+      ...other,
     });
     this.setStatus("");
 
-    switch(this.state.ui) {
+    switch (this.state.ui) {
       case uiState.PROCESSING:
-        this.setState({ ui: isPartial ? uiState.VIEWING : uiState.VIEWING });
+        this.setState({ ui: uiState.VIEWING });
         break;
       case uiState.PENDING:
         if (!isPartial) this.setState({ ui: uiState.VIEWING }, () => this.startBuild());
         break;
       case uiState.VIEWING:
-        // intermediate update while already viewing — just update url/stats
         break;
       default:
         break;
@@ -389,57 +471,113 @@ class App extends React.Component {
   }
 }
 
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
 function removeKey(old) {
-  var x = {...old};
-  for(let i=1; i<arguments.length; i++) {
-    delete x[arguments[i]];
-  }
+  const x = { ...old };
+  for (let i = 1; i < arguments.length; i++) delete x[arguments[i]];
   return x;
 }
 
+// ─── Components ───────────────────────────────────────────────────────────────
+
 function ParameterSlider(props) {
   return (
-      <Grid container direction="column" spacing={0}>
-        <Grid item>
-          <Tooltip title={props.tooltip} arrow>
-            <Typography>{props.title}</Typography>
-          </Tooltip>
-        </Grid>
-        <Grid item>
-          <Tooltip title={props.tooltip} arrow>
-            <Slider
-              min={props.min}
-              max={props.max}
-              value={props.value}
-              onChange={(c, newValue) => props.onChange(newValue)}
-              aria-labelledby="continuous-slider"
-              valueLabelDisplay="auto"
-              {...removeKey(props, "title")}
-            />
-          </Tooltip>
-        </Grid>
+    <Grid container direction="column" spacing={0}>
+      <Grid item>
+        <Tooltip title={props.tooltip} arrow>
+          <Typography>{props.title}</Typography>
+        </Tooltip>
       </Grid>
+      <Grid item>
+        <Tooltip title={props.tooltip} arrow>
+          <Slider
+            min={props.min}
+            max={props.max}
+            value={props.value}
+            onChange={(c, newValue) => props.onChange(newValue)}
+            aria-labelledby="continuous-slider"
+            valueLabelDisplay="auto"
+            {...removeKey(props, "title")}
+          />
+        </Tooltip>
+      </Grid>
+    </Grid>
   );
 }
 
 function ParameterCheckbox(props) {
   return (
-      <Grid container direction="column" spacing={0}>
-        <Grid item>
-          <Tooltip title={props.tooltip} arrow>
-            <FormControlLabel control={
-              <Checkbox
-                color="primary"
-                checked={props.value}
-                onChange={(c, newValue) => props.onChange(newValue)}
-                aria-labelledby="continuous-slider"
-                valueLabelDisplay="auto"
-                {...removeKey(props, "title")}
-              />}
-              label={props.title} />
-          </Tooltip>
-        </Grid>
+    <Grid container direction="column" spacing={0}>
+      <Grid item>
+        <Tooltip title={props.tooltip} arrow>
+          <FormControlLabel control={
+            <Checkbox
+              color="primary"
+              checked={props.value}
+              onChange={(c, newValue) => props.onChange(newValue)}
+              aria-labelledby="continuous-slider"
+              valueLabelDisplay="auto"
+              {...removeKey(props, "title")}
+            />}
+            label={props.title} />
+        </Tooltip>
       </Grid>
+    </Grid>
+  );
+}
+
+function ColorPaletteEditor({ colors, onChange, onAutoSuggest }) {
+  const MAX_COLORS = 12;
+  const MIN_COLORS = 1;
+
+  function addColor() {
+    if (colors.length >= MAX_COLORS) return;
+    onChange([...colors, { hex: '#888888' }]);
+  }
+
+  function removeColor(index) {
+    if (colors.length <= MIN_COLORS) return;
+    onChange(colors.filter((_, i) => i !== index));
+  }
+
+  function updateColor(index, value) {
+    const hex = typeof value === 'string' ? value : '#' + value.hex;
+    onChange(colors.map((c, i) => i === index ? { ...c, hex } : c));
+  }
+
+  return (
+    <div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2 }}>
+        {colors.map((c, i) => (
+          <div key={i} style={{ position: 'relative', display: 'inline-flex' }}>
+            <ColorPicker
+              value={c.hex}
+              hideTextfield
+              disableAlpha
+              onChange={v => updateColor(i, v)}
+            />
+            {colors.length > MIN_COLORS && (
+              <span
+                onClick={() => removeColor(i)}
+                style={{
+                  position: 'absolute', top: -4, right: -4, cursor: 'pointer',
+                  background: '#fff', borderRadius: '50%', fontSize: 9,
+                  lineHeight: '13px', width: 13, textAlign: 'center',
+                  border: '1px solid #aaa', zIndex: 1, userSelect: 'none',
+                }}
+              >x</span>
+            )}
+          </div>
+        ))}
+        {colors.length < MAX_COLORS && (
+          <Button onClick={addColor} style={{ minWidth: 24, padding: '2px 4px', fontSize: 16, lineHeight: 1 }}>+</Button>
+        )}
+      </div>
+      <Button size="small" onClick={onAutoSuggest} style={{ marginTop: 4, fontSize: 10, padding: '2px 6px' }}>
+        Auto-suggest
+      </Button>
+    </div>
   );
 }
 
@@ -447,7 +585,7 @@ function AppDrawer(props) {
   const classes = madeStyles();
 
   return (
-    <Drawer variant="permanent" anchor="left" className={classes.drawer} classes={{paper: classes.drawerPaper}}>
+    <Drawer variant="permanent" anchor="left" className={classes.drawer} classes={{ paper: classes.drawerPaper }}>
       <List spacing={0}>
         <ListItem>
           <ParameterSlider min={0} max={100} value={props.resolution} onChange={(e, c) => props.onChange({ resolution: c })} title="Resolution" tooltip="Size of the result" />
@@ -461,14 +599,22 @@ function AppDrawer(props) {
         <ListItem>
           <ParameterSlider min={0} max={255} value={props.whiteCutoff} onChange={(e, c) => props.onChange({ whiteCutoff: c })} title="White cutoff" tooltip="How white an area has to be to not draw in it" />
         </ListItem>
-        <ListItem style={{marginTop: -10}}>
+        <ListItem style={{ marginTop: -10 }}>
           <ParameterCheckbox value={props.invert} onChange={(e, c) => props.onChange({ invert: c })} title="Invert image" tooltip="Fill white instead of black" />
         </ListItem>
-        <ListItem style={{marginTop: -10}}>
-          Colors:
-            <ColorPicker value={props.fg} hideTextfield disableAlpha onChange={c => props.onChange({ fg: c })} />
-            <Button style={{ minWidth: 0 }} onClick={() => props.onChange( { fg: props.bg, bg: props.fg }) }>&#11020;</Button>
-            <ColorPicker value={props.bg} hideTextfield disableAlpha onChange={c => props.onChange({ bg: c })} />
+        <ListItem style={{ marginTop: -10 }}>
+          <div style={{ width: '100%' }}>
+            <Typography variant="caption" style={{ display: 'block', marginBottom: 4 }}>Thread colors</Typography>
+            <ColorPaletteEditor
+              colors={props.colors}
+              onChange={colors => props.onChange({ colors })}
+              onAutoSuggest={props.onAutoSuggest}
+            />
+            <div style={{ display: 'flex', alignItems: 'center', marginTop: 8 }}>
+              <Typography variant="caption" style={{ marginRight: 8 }}>Background</Typography>
+              <ColorPicker value={props.bg} hideTextfield disableAlpha onChange={c => props.onChange({ bg: c })} />
+            </div>
+          </div>
         </ListItem>
         <Button variant="contained" onClick={props.onResetParams} className={classes.highButton}>Reset</Button>
         <Divider />
@@ -485,9 +631,9 @@ function AppDrawer(props) {
 function loadFromImg(props, event) {
   let xhttp = new XMLHttpRequest();
   xhttp.responseType = "arraybuffer";
-  xhttp.onreadystatechange = function() {
+  xhttp.onreadystatechange = function () {
     if (this.readyState === 4) {
-      if(this.status === 200) {
+      if (this.status === 200) {
         onImageSelect(props, xhttp.response);
       } else {
         console.log("Can't load image", xhttp);
@@ -500,10 +646,9 @@ function loadFromImg(props, event) {
 
 function loadFromFile(props, event) {
   if (event.target.files.length === 0) return;
-
-  let reader = new FileReader();
+  const reader = new FileReader();
   reader.onload = e => readerOnLoad(props, e);
-  reader.onerror = clearImage;
+  reader.onerror = () => {};
   reader.readAsArrayBuffer(event.target.files[0]);
 }
 
@@ -515,71 +660,64 @@ function onImageSelect(props, arrayBuffer) {
   props.onImageSelected({ data: arrayBuffer });
 }
 
-function clearImage() {
-}
-
 function ImageSelector(props) {
   const classes = madeStyles();
-  const onClick = e => { props.onImageLoading(e); loadFromImg(props, e); }
-  const onFile = e => { props.onImageLoading(e); loadFromFile(props, e); }
+  const onClick = e => { props.onImageLoading(e); loadFromImg(props, e); };
+  const onFile = e => { props.onImageLoading(e); loadFromFile(props, e); };
   return (
-    <div id="imageSelector" style={{ "textAlign": "center", "width": "100%", "position": "absolute", "top": "50%", "transform": "translateY(-50%)", "zIndex": "1" }}>
-    <div className={classes.imageSelector}>
-      <div>
-        <div style={{ display: "flex", "flexDirection": "column", "justifyContent": "center" }}>
-          <Typography variant="h5">
-            Try an example
-          </Typography>
-          <div style={{ "paddingTop": "20px", "paddingBottom": "20px" }}>
-            <ImageExample onClick={onClick} src={exPig} title="Draw me like one of your French pigs. Oinque." />
-            <ImageExample onClick={onClick} src={exWorld} title="Around the world, around the world, around the world, around the world - Daft Punk" />
-            <ImageExample onClick={onClick} src={exDog} title="I've heard humans say it's a doggy dog world, and I couldn't agree more." />
-          </div>
-          <BorderWithText text="or" />
-          <div>
-            <Typography variant="h5" style={{"paddingTop": "20px", "paddingBottom": "20px" }}>
-              Upload your own
-            </Typography>
-            <input type="file" id="file" onChange={onFile} accept="image/*" title="The image is processed locally and never uploaded. Do what you wish with this information." />
+    <div id="imageSelector" style={{ textAlign: "center", width: "100%", position: "absolute", top: "50%", transform: "translateY(-50%)", zIndex: "1" }}>
+      <div className={classes.imageSelector}>
+        <div>
+          <div style={{ display: "flex", flexDirection: "column", justifyContent: "center" }}>
+            <Typography variant="h5">Try an example</Typography>
+            <div style={{ paddingTop: "20px", paddingBottom: "20px" }}>
+              <ImageExample onClick={onClick} src={exPig} title="Draw me like one of your French pigs. Oinque." />
+              <ImageExample onClick={onClick} src={exWorld} title="Around the world, around the world, around the world, around the world - Daft Punk" />
+              <ImageExample onClick={onClick} src={exDog} title="I've heard humans say it's a doggy dog world, and I couldn't agree more." />
+            </div>
+            <BorderWithText text="or" />
+            <div>
+              <Typography variant="h5" style={{ paddingTop: "20px", paddingBottom: "20px" }}>Upload your own</Typography>
+              <input type="file" id="file" onChange={onFile} accept="image/*" title="The image is processed locally and never uploaded." />
+            </div>
           </div>
         </div>
       </div>
-    </div>
     </div>
   );
 }
 
 function Spinner(props) {
-    const classes = madeStyles();
-    return (
-      <div style={{ "textAlign": "center", "width": "100%", "position": "absolute", "top": "50%", "transform": "translateY(-50%)", "zIndex": "1" }}>
-        <div className={classes.imageSelector}>
-          <CircularProgress color="primary" style={{ marginTop: 10, marginBottom: 10 }}/>
-          <Typography>{props.children}</Typography>
-        </div>
+  const classes = madeStyles();
+  return (
+    <div style={{ textAlign: "center", width: "100%", position: "absolute", top: "50%", transform: "translateY(-50%)", zIndex: "1" }}>
+      <div className={classes.imageSelector}>
+        <CircularProgress color="primary" style={{ marginTop: 10, marginBottom: 10 }} />
+        <Typography>{props.children}</Typography>
       </div>
-    );
+    </div>
+  );
 }
 
 function ErrorMessage(props) {
-    const classes = madeStyles();
-    return (
-      <div style={{ "textAlign": "center", "width": "100%", "position": "absolute", "top": "50%", "transform": "translateY(-50%)", "zIndex": "1" }}>
-        <div className={classes.errorBox}>
-          <Typography>{props.children}</Typography>
-          <br />
-          <Button variant="contained" color="primary" onClick={props.onAccept}>Ok</Button>
-        </div>
+  const classes = madeStyles();
+  return (
+    <div style={{ textAlign: "center", width: "100%", position: "absolute", top: "50%", transform: "translateY(-50%)", zIndex: "1" }}>
+      <div className={classes.errorBox}>
+        <Typography>{props.children}</Typography>
+        <br />
+        <Button variant="contained" color="primary" onClick={props.onAccept}>Ok</Button>
       </div>
-    );
+    </div>
+  );
 }
 
 function BorderWithText(props) {
-  const borderStyle = { "borderBottom": "1px solid #aaa", "width": "100%", "height": "1px" };
+  const borderStyle = { borderBottom: "1px solid #aaa", width: "100%", height: "1px" };
   return (
-    <div style={{"display": "flex", "alignItems": "center"}}>
+    <div style={{ display: "flex", alignItems: "center" }}>
       <div className="border" style={borderStyle} />
-      <span style={{"marginLeft": "0.5em", "marginRight": "0.5em", "marginTop": "-0.1em" }}>{props.text}</span>
+      <span style={{ marginLeft: "0.5em", marginRight: "0.5em", marginTop: "-0.1em" }}>{props.text}</span>
       <div className="border" style={borderStyle} />
     </div>
   );
@@ -587,8 +725,8 @@ function BorderWithText(props) {
 
 function ImageExample(props) {
   return (
-    <Button onClick={props.onClick} style={{"padding": "0px"}}>
-      <img src={props.src} style={{"height": "100px"}} alt={props.title} title={props.title} />
+    <Button onClick={props.onClick} style={{ padding: "0px" }}>
+      <img src={props.src} style={{ height: "100px" }} alt={props.title} title={props.title} />
     </Button>
   );
 }
