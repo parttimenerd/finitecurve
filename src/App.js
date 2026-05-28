@@ -232,6 +232,8 @@ class App extends React.Component {
       map: { scale: 1, translation: { x: 0, y: 0 } },
       controls: this.getDefaultControls(),
       threadPlan: null,
+      originalImageUrl: null,
+      showOriginal: false,
     };
     OneLineClient.onResult = d => this.processResult(this, d);
   }
@@ -259,7 +261,7 @@ class App extends React.Component {
   }
 
   openFeedback() {
-    window.location.href = "https://www.facebook.com/finitecurve";
+    window.open("https://github.com/parttimenerd/finitecurve/issues", "_blank");
   }
 
   getUiStateElement() {
@@ -292,6 +294,11 @@ class App extends React.Component {
   onImageSelected(event) {
     this._lastImageBuffer = event.data;
     this.setStatus("Processing...");
+
+    // Create a stable object URL for the original image (for compare overlay).
+    if (this.state.originalImageUrl) URL.revokeObjectURL(this.state.originalImageUrl);
+    const originalImageUrl = URL.createObjectURL(new Blob([event.data]));
+    this.setState({ originalImageUrl, showOriginal: false });
 
     decodeImageRGBA(event.data).then(decoded => {
       this._lastDecodedImage = decoded;
@@ -586,8 +593,11 @@ class App extends React.Component {
           onFeedback={() => this.openFeedback()}
           onAutoSuggest={() => this.autoSuggestPalette()}
           onReorderThreads={(from, to) => this.reorderThreads(from, to)}
+          onToggleCompare={() => this.setState(s => ({ showOriginal: !s.showOriginal }))}
           canSelect={this.state.ui !== uiState.SELECTING}
           canDownload={this.state.ui === uiState.VIEWING}
+          canCompare={!!this.state.originalImageUrl && this.state.ui === uiState.VIEWING}
+          showOriginal={this.state.showOriginal}
         />
         <div className={classes.content} id="content" style={{ backgroundColor: this.state.background }}>
           <Typography className={classes.toast}>{this.getToastMessage()}</Typography>
@@ -595,6 +605,10 @@ class App extends React.Component {
           {this.getUiStateElement(this.state.ui)}
           <MapInteractionCSS value={this.state.map} onChange={(c) => this.setState({ map: c })}>
             <img src={this.state.url} width={this.state.width + "px"} height={this.state.height + "px"} alt="" />
+            {this.state.showOriginal && this.state.originalImageUrl &&
+              <img src={this.state.originalImageUrl} width={this.state.width + "px"} height={this.state.height + "px"} alt="original"
+                style={{ position: 'absolute', top: 0, left: 0, opacity: 0.5, pointerEvents: 'none' }} />
+            }
           </MapInteractionCSS>
         </div>
       </div>
@@ -1006,8 +1020,9 @@ function AppDrawer(props) {
         <Button variant="contained" color="primary" onClick={props.onNewImage} className={classes.lowButton} disabled={!props.canSelect}>Choose Image</Button>
         <Button variant="contained" color="primary" onClick={props.onDownloadSVG} className={classes.lowButton} disabled={!props.canDownload}>Download SVG</Button>
         <Button variant="contained" color="primary" onClick={props.onDownloadPNG} className={classes.lowHighButton} disabled={!props.canDownload}>Download PNG</Button>
+        <Button variant="contained" color={props.showOriginal ? "secondary" : "default"} onClick={props.onToggleCompare} className={classes.lowButton} disabled={!props.canCompare}>{props.showOriginal ? "Hide Original" : "Compare"}</Button>
         <Divider />
-        <Button variant="contained" onClick={props.onFeedback} className={classes.lowButton}>Feedback (FB)</Button>
+        <Button variant="contained" onClick={props.onFeedback} className={classes.lowButton}>Feedback / Issues</Button>
       </List>
     </Drawer>
   );
