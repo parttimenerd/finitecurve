@@ -63,9 +63,19 @@ function extractPath(svg) {
   return m ? { strokeWidth: m[1], d: m[2] } : { strokeWidth: '1', d: '' };
 }
 
+// threads sorted so darkest luminance is first (laid down first, lighter threads on top)
+function luminanceHex(hex) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
+}
+
 function assembleSVG(width, height, colorPaths) {
+  // Render darkest first so lighter threads visually overlap darker ones.
+  // colorPaths may already be in the user's intended order; sort by luminance
+  // to ensure correct SVG layering regardless of palette slot order.
+  const sorted = [...colorPaths].sort((a, b) => luminanceHex(a.hex) - luminanceHex(b.hex));
   let out = `<svg viewBox='0 0 ${width} ${height}' width='${width}' height='${height}' xmlns='http://www.w3.org/2000/svg'>\n`;
-  for (const { hex, strokeWidth, d } of colorPaths) {
+  for (const { hex, strokeWidth, d } of sorted) {
     if (!d) continue;
     out += `<path stroke='${hex}' fill='none' stroke-width='${strokeWidth}' d='${d}' />\n`;
   }
@@ -133,6 +143,7 @@ const client = {
   setImage,
   build,
   buildMulti,
+  assembleSVG,
   onResult: undefined,
 };
 

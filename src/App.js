@@ -109,20 +109,6 @@ const madeStyles = makeStyles(styles);
 
 // ─── Palette utilities ────────────────────────────────────────────────────────
 
-function rgbToHSL(r, g, b) {
-  r /= 255; g /= 255; b /= 255;
-  const max = Math.max(r, g, b), min = Math.min(r, g, b);
-  const l = (max + min) / 2;
-  if (max === min) return [0, 0, l];
-  const d = max - min;
-  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h;
-  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
-  else if (max === g) h = (b - r) / d + 2;
-  else h = (r - g) / d + 4;
-  return [h * 60, s, l];
-}
-
 function rgbToHex(r, g, b) {
   return '#' + [r, g, b].map(v => Math.round(v).toString(16).padStart(2, '0')).join('');
 }
@@ -166,6 +152,7 @@ async function suggestPalette(arrayBuffer, n) {
     [...sorted[Math.floor(i * sorted.length / n)]]
   );
 
+  let clusterCounts = new Array(n).fill(0);
   for (let iter = 0; iter < 8; iter++) {
     const sums = Array.from({ length: n }, () => [0, 0, 0, 0]);
     for (const [r, g, b] of samples) {
@@ -181,11 +168,23 @@ async function suggestPalette(arrayBuffer, n) {
     centroids = sums.map(([r, g, b, c], i) =>
       c > 0 ? [r / c, g / c, b / c] : prev[i]
     );
+    clusterCounts = sums.map(s => s[3]);
   }
 
-  // Sort by hue for a rainbow-ish ordering
-  centroids.sort((a, b) => rgbToHSL(...a)[0] - rgbToHSL(...b)[0]);
-  return centroids.map(([r, g, b]) => ({ hex: rgbToHex(r, g, b) }));
+  // Find dominant centroid index (largest cluster) before sorting
+  const dominantIdx = clusterCounts.reduce((best, c, i) => c > clusterCounts[best] ? i : best, 0);
+  const dominantRGB = centroids[dominantIdx];
+
+  // Sort by luminance darkest first — correct embroidery order, darker threads laid first
+  centroids.sort((a, b) => (0.299*a[0]+0.587*a[1]+0.114*a[2]) - (0.299*b[0]+0.587*b[1]+0.114*b[2]));
+  const palette = centroids.map(([r, g, b]) => ({ hex: rgbToHex(r, g, b) }));
+
+  // Mark the dominant color as suggested for duplication
+  const domHex = rgbToHex(...dominantRGB);
+  const domEntry = palette.find(c => c.hex === domHex);
+  if (domEntry) domEntry.suggestDuplicate = true;
+
+  return palette;
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -214,6 +213,7 @@ class App extends React.Component {
     super(props);
     this._lastDecodedImage = null;
     this._lastImageBuffer = null;
+    this._lastColorPaths = null; // [{ hex, d }] — cached for live stroke-width updates
     this.state = {
       lastDraw: 0,
       url: "data:",
@@ -349,9 +349,25 @@ class App extends React.Component {
     const time = Date.now();
     const next = { ...this.state.controls, ...c, timestamp: time };
     this.setState({ controls: next });
+
+    // Live stroke-width: recompose SVG from cached paths without re-rendering
+    if ('lineWidth' in c && this._lastColorPaths && this.state.ui === uiState.VIEWING) {
+      this.recomposeSVG(c.lineWidth);
+      return; // don't trigger a full rebuild for stroke-width changes
+    }
+
     if (this.state.ui !== uiState.SELECTING) {
       setTimeout(() => this.triggerBuild(time), 1000);
     }
+  }
+
+  recomposeSVG(lineWidth) {
+    if (!this._lastColorPaths) return;
+    const sw = String(lineWidth);
+    const colorPaths = this._lastColorPaths.map(p => ({ ...p, strokeWidth: sw }));
+    const svg = OneLineClient.assembleSVG(this.state.width, this.state.height, colorPaths);
+    const url = "data:image/svg+xml;charset=utf-8;base64," + btoa(svg);
+    this.setState({ url });
   }
 
   openImageSelection() {
@@ -446,11 +462,26 @@ class App extends React.Component {
     if (data.success) {
       const isPartial = data.type === 'partial';
       let svg = data.result;
-      // Single-color mode: inject fg color (worker always emits stroke='black')
+
       if (!this.state.controls.multiColor) {
+        // Single-color: inject fg, cache as single-path
         const fgHex = this.toHexColor(this.state.controls.fg);
         svg = svg.replace("stroke='black'", `stroke='${fgHex}'`);
+        // Extract and cache for live stroke-width
+        const m = svg.match(/d='([\s\S]*?)'\s*\/>/);
+        if (m) this._lastColorPaths = [{ hex: fgHex, d: m[1] }];
+      } else {
+        // Multi-color: SVG already has correct colors; extract paths for caching
+        const pathRe = /stroke='([^']+)'[^d]*d='([\s\S]*?)'\s*\/>/g;
+        const paths = [];
+        let pm;
+        // eslint-disable-next-line no-cond-assign
+        while ((pm = pathRe.exec(svg)) !== null) {
+          paths.push({ hex: pm[1], d: pm[2] });
+        }
+        if (paths.length > 0) this._lastColorPaths = paths;
       }
+
       const url = "data:image/svg+xml;charset=utf-8;base64," + btoa(svg);
       this.setImageUrl(url, data.width, data.height, {
         lineLength: data.lineLength,
@@ -544,6 +575,11 @@ function ParameterCheckbox(props) {
   );
 }
 
+function hexLuminance(hex) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
+}
+
 function ColorPaletteEditor({ colors, onChange, onAutoSuggest }) {
   const MAX_COLORS = 12;
   const MIN_COLORS = 1;
@@ -563,37 +599,99 @@ function ColorPaletteEditor({ colors, onChange, onAutoSuggest }) {
     onChange(colors.map((c, i) => i === index ? { ...c, hex } : c));
   }
 
+  function duplicateColor(index) {
+    if (colors.length >= MAX_COLORS) return;
+    const copy = { ...colors[index], suggestDuplicate: false };
+    const next = [...colors];
+    next.splice(index + 1, 0, copy);
+    onChange(next);
+  }
+
+  function moveColor(index, dir) {
+    const next = [...colors];
+    const target = index + dir;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    onChange(next);
+  }
+
+  function sortByLuminance() {
+    onChange([...colors].sort((a, b) => hexLuminance(a.hex) - hexLuminance(b.hex)));
+  }
+
   return (
     <div>
-      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 4 }}>
         {colors.map((c, i) => (
-          <div key={i} style={{ position: 'relative', display: 'inline-flex' }}>
-            <ColorPicker
-              value={c.hex}
-              hideTextfield
-              disableAlpha
-              onChange={v => updateColor(i, v)}
-            />
-            {colors.length > MIN_COLORS && (
-              <span
-                onClick={() => removeColor(i)}
-                style={{
-                  position: 'absolute', top: -4, right: -4, cursor: 'pointer',
-                  background: '#fff', borderRadius: '50%', fontSize: 9,
-                  lineHeight: '13px', width: 13, textAlign: 'center',
-                  border: '1px solid #aaa', zIndex: 1, userSelect: 'none',
-                }}
-              >x</span>
+          <div key={i} style={{ position: 'relative', display: 'inline-flex', flexDirection: 'column', alignItems: 'center' }}>
+            <div style={{ position: 'relative', display: 'inline-flex' }}>
+              <ColorPicker
+                value={c.hex}
+                hideTextfield
+                disableAlpha
+                onChange={v => updateColor(i, v)}
+              />
+              {colors.length > MIN_COLORS && (
+                <span
+                  onClick={() => removeColor(i)}
+                  style={{
+                    position: 'absolute', top: -4, right: -4, cursor: 'pointer',
+                    background: '#fff', borderRadius: '50%', fontSize: 9,
+                    lineHeight: '13px', width: 13, textAlign: 'center',
+                    border: '1px solid #aaa', zIndex: 1, userSelect: 'none',
+                  }}
+                >x</span>
+              )}
+              {c.suggestDuplicate && colors.length < MAX_COLORS && (
+                <Tooltip title="Dominant color — click to add a second pass" arrow>
+                  <span
+                    onClick={() => duplicateColor(i)}
+                    style={{
+                      position: 'absolute', bottom: -4, right: -4, cursor: 'pointer',
+                      background: '#ffe066', borderRadius: '50%', fontSize: 9,
+                      lineHeight: '13px', width: 13, textAlign: 'center',
+                      border: '1px solid #aaa', zIndex: 1, userSelect: 'none',
+                    }}
+                  >★</span>
+                </Tooltip>
+              )}
+            </div>
+            {colors.length > 1 && (
+              <div style={{ display: 'flex', marginTop: 1 }}>
+                <span
+                  onClick={() => moveColor(i, -1)}
+                  style={{
+                    cursor: i === 0 ? 'default' : 'pointer',
+                    opacity: i === 0 ? 0.2 : 0.7,
+                    fontSize: 9, userSelect: 'none', lineHeight: 1, padding: '0 1px',
+                  }}
+                >◀</span>
+                <span
+                  onClick={() => moveColor(i, 1)}
+                  style={{
+                    cursor: i === colors.length - 1 ? 'default' : 'pointer',
+                    opacity: i === colors.length - 1 ? 0.2 : 0.7,
+                    fontSize: 9, userSelect: 'none', lineHeight: 1, padding: '0 1px',
+                  }}
+                >▶</span>
+              </div>
             )}
           </div>
         ))}
         {colors.length < MAX_COLORS && (
-          <Button onClick={addColor} style={{ minWidth: 24, padding: '2px 4px', fontSize: 16, lineHeight: 1 }}>+</Button>
+          <Button onClick={addColor} style={{ minWidth: 24, padding: '2px 4px', fontSize: 16, lineHeight: 1, alignSelf: 'flex-start' }}>+</Button>
         )}
       </div>
-      <Button size="small" onClick={onAutoSuggest} style={{ marginTop: 4, fontSize: 10, padding: '2px 6px' }}>
-        Auto-suggest
-      </Button>
+      <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+        <Button size="small" onClick={onAutoSuggest} style={{ fontSize: 10, padding: '2px 6px' }}>
+          Auto-suggest
+        </Button>
+        <Tooltip title="Sort darkest first (embroidery order)" arrow>
+          <Button size="small" onClick={sortByLuminance} style={{ fontSize: 10, padding: '2px 6px' }}>
+            Sort ↕
+          </Button>
+        </Tooltip>
+      </div>
     </div>
   );
 }
