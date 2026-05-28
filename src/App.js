@@ -23,7 +23,7 @@ import exDog from './examples/dog.jpg';
 import exWorld from './examples/world.png';
 
 import OneLineClient from './OneLineClient.js';
-import { separateColors, splitChannelIntoSlices } from './colorSeparate.js';
+import { separateColors, computeThreadPlan } from './colorSeparate.js';
 
 import './App.css';
 window.React = React;
@@ -212,7 +212,8 @@ class App extends React.Component {
     super(props);
     this._lastDecodedImage = null;
     this._lastImageBuffer = null;
-    this._lastColorPaths = null; // [{ hex, d }] — cached for live stroke-width updates
+    this._lastColorPaths = null;
+    this._lastThreadPlan = null;
     this._buildTimer = null;
     this.state = {
       lastDraw: 0,
@@ -224,6 +225,7 @@ class App extends React.Component {
       status: "",
       map: { scale: 1, translation: { x: 0, y: 0 } },
       controls: this.getDefaultControls(),
+      threadPlan: null,
     };
     OneLineClient.onResult = d => this.processResult(this, d);
   }
@@ -304,43 +306,24 @@ class App extends React.Component {
 
   startBuild() {
     if (!this._lastDecodedImage) return;
-    this.setState({ ui: uiState.PROCESSING }, () => {
+    this._lastThreadPlan = null;
+    this.setState({ ui: uiState.PROCESSING, threadPlan: null }, () => {
       const { colors, multiColor, fg, numThreads, ...commonOptions } = this.state.controls;
       const { rgbaData, width, height } = this._lastDecodedImage;
 
       if (multiColor) {
-        const channels = separateColors(rgbaData, width, height, colors);
+        const bgHex = this.toHexColor(commonOptions.bg);
+        const channels = separateColors(rgbaData, width, height, colors, bgHex);
+        const plan = computeThreadPlan(colors, channels, width, height, Math.max(numThreads, colors.length));
+        this._lastThreadPlan = plan;
+        this.setState({ threadPlan: plan.map(e => ({ hex: e.hex, colorIndex: e.colorIndex, sliceIndex: e.sliceIndex, totalSlices: e.totalSlices, pixelCount: e.pixelCount })) });
 
-        // Distribute extra thread budget across colors by size of their pixel region.
-        // Extra slots go to colors with the most pixels so disconnected regions get
-        // their own pass and avoid long connector lines.
-        const totalThreads = Math.max(numThreads, colors.length);
-        const extra = totalThreads - colors.length;
-
-        const pixelCounts = channels.map(ch => {
-          let count = 0;
-          for (let i = 0; i < ch.length; i++) if (ch[i] !== 255) count++;
-          return count;
-        });
-
-        const slots = new Array(colors.length).fill(1);
-        for (let e = 0; e < extra; e++) {
-          let best = 0, bestRatio = -1;
-          for (let k = 0; k < colors.length; k++) {
-            const ratio = pixelCounts[k] / slots[k];
-            if (ratio > bestRatio) { bestRatio = ratio; best = k; }
-          }
-          slots[best]++;
-        }
-
-        const threads = [];
-        for (let i = 0; i < colors.length; i++) {
-          const slices = splitChannelIntoSlices(channels[i], width, height, slots[i]);
-          for (const slice of slices) {
-            threads.push({ hex: this.toHexColor(colors[i].hex), grayscaleChannel: slice, width, height });
-          }
-        }
-
+        const threads = plan.map(entry => ({
+          hex: this.toHexColor(entry.hex),
+          grayscaleChannel: entry.grayscaleChannel,
+          width,
+          height,
+        }));
         OneLineClient.buildMulti(threads, commonOptions);
       } else {
         OneLineClient.setImage(this._lastImageBuffer);
@@ -480,6 +463,7 @@ class App extends React.Component {
       <div className={classes.root}>
         <AppDrawer
           {...this.state.controls}
+          threadPlan={this.state.threadPlan}
           onChange={c => this.changeControls(c)}
           onNewImage={() => this.openImageSelection()}
           onDownloadSVG={() => this.downloadFile("finitecurve.svg", this.state.url)}
@@ -628,7 +612,7 @@ function hexLuminance(hex) {
   return 0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255);
 }
 
-function ColorPaletteEditor({ colors, numThreads, onChange, onAutoSuggest, onNumThreadsChange }) {
+function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSuggest }) {
   const MAX_COLORS = 12;
   const MIN_COLORS = 1;
   const dragIdxRef = React.useRef(null);
@@ -689,10 +673,23 @@ function ColorPaletteEditor({ colors, numThreads, onChange, onAutoSuggest, onNum
     setDragOver(null);
   }
 
-  const extraThreads = numThreads - colors.length;
+  // Build the thread view from the last computed plan.
+  // While a plan isn't available, show a placeholder based on numThreads.
+  const threadRows = threadPlan
+    ? threadPlan.map((entry, i) => ({ ...entry, key: i }))
+    : Array.from({ length: numThreads }, (_, i) => ({
+        key: i,
+        hex: colors[i % colors.length]?.hex || '#888',
+        colorIndex: i % colors.length,
+        sliceIndex: 0,
+        totalSlices: 1,
+        pixelCount: null,
+      }));
 
   return (
     <div>
+      {/* ── Color palette (unique hues) ── */}
+      <Typography variant="caption" style={{ display: 'block', marginBottom: 2, color: '#555' }}>Colors (drag to reorder)</Typography>
       <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 4 }}>
         {colors.map((c, i) => (
           <div
@@ -710,34 +707,23 @@ function ColorPaletteEditor({ colors, numThreads, onChange, onAutoSuggest, onNum
             }}
           >
             <div style={{ position: 'relative', display: 'inline-flex' }}>
-              <ColorPicker
-                value={c.hex}
-                hideTextfield
-                disableAlpha
-                onChange={v => updateColor(i, v)}
-              />
+              <ColorPicker value={c.hex} hideTextfield disableAlpha onChange={v => updateColor(i, v)} />
               {colors.length > MIN_COLORS && (
-                <span
-                  onClick={() => removeColor(i)}
-                  style={{
-                    position: 'absolute', top: -4, right: -4, cursor: 'pointer',
-                    background: '#fff', borderRadius: '50%', fontSize: 9,
-                    lineHeight: '13px', width: 13, textAlign: 'center',
-                    border: '1px solid #aaa', zIndex: 1, userSelect: 'none',
-                  }}
-                >x</span>
+                <span onClick={() => removeColor(i)} style={{
+                  position: 'absolute', top: -4, right: -4, cursor: 'pointer',
+                  background: '#fff', borderRadius: '50%', fontSize: 9,
+                  lineHeight: '13px', width: 13, textAlign: 'center',
+                  border: '1px solid #aaa', zIndex: 1, userSelect: 'none',
+                }}>x</span>
               )}
               {c.suggestDuplicate && colors.length < MAX_COLORS && (
                 <Tooltip title="Dominant color — click to add a second pass" arrow>
-                  <span
-                    onClick={() => duplicateColor(i)}
-                    style={{
-                      position: 'absolute', bottom: -4, right: -4, cursor: 'pointer',
-                      background: '#ffe066', borderRadius: '50%', fontSize: 9,
-                      lineHeight: '13px', width: 13, textAlign: 'center',
-                      border: '1px solid #aaa', zIndex: 1, userSelect: 'none',
-                    }}
-                  >★</span>
+                  <span onClick={() => duplicateColor(i)} style={{
+                    position: 'absolute', bottom: -4, right: -4, cursor: 'pointer',
+                    background: '#ffe066', borderRadius: '50%', fontSize: 9,
+                    lineHeight: '13px', width: 13, textAlign: 'center',
+                    border: '1px solid #aaa', zIndex: 1, userSelect: 'none',
+                  }}>★</span>
                 </Tooltip>
               )}
             </div>
@@ -747,19 +733,45 @@ function ColorPaletteEditor({ colors, numThreads, onChange, onAutoSuggest, onNum
           <Button onClick={addColor} style={{ minWidth: 24, padding: '2px 4px', fontSize: 16, lineHeight: 1, alignSelf: 'flex-start' }}>+</Button>
         )}
       </div>
-      {extraThreads > 0 && (
-        <Typography variant="caption" style={{ display: 'block', marginTop: 4, color: '#888' }}>
-          +{extraThreads} extra {extraThreads === 1 ? 'pass' : 'passes'} — largest disconnected regions rendered separately
-        </Typography>
-      )}
-      <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
-        <Button size="small" onClick={onAutoSuggest} style={{ fontSize: 10, padding: '2px 6px' }}>
-          Auto-suggest
-        </Button>
+
+      {/* ── Thread order (actual build passes) ── */}
+      <Typography variant="caption" style={{ display: 'block', marginTop: 8, marginBottom: 2, color: '#555' }}>
+        Threads ({threadRows.length} passes)
+      </Typography>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
+        {threadRows.map((entry, i) => {
+          const isMultiSlice = entry.totalSlices > 1;
+          return (
+            <Tooltip
+              key={entry.key}
+              arrow
+              title={isMultiSlice
+                ? `Part ${entry.sliceIndex + 1}/${entry.totalSlices} of this color${entry.pixelCount != null ? ` (${entry.pixelCount.toLocaleString()} px)` : ''}`
+                : (entry.pixelCount != null ? `${entry.pixelCount.toLocaleString()} px` : '')}
+            >
+              <div style={{
+                width: 18, height: 18, borderRadius: 3,
+                backgroundColor: entry.hex,
+                border: isMultiSlice ? '2px dashed rgba(0,0,0,0.35)' : '1px solid rgba(0,0,0,0.18)',
+                boxSizing: 'border-box',
+                position: 'relative',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>
+                {isMultiSlice && (
+                  <span style={{ fontSize: 7, color: hexLuminance(entry.hex) > 128 ? '#333' : '#eee', lineHeight: 1, userSelect: 'none' }}>
+                    {entry.sliceIndex + 1}
+                  </span>
+                )}
+              </div>
+            </Tooltip>
+          );
+        })}
+      </div>
+
+      <div style={{ display: 'flex', gap: 4, marginTop: 6, flexWrap: 'wrap' }}>
+        <Button size="small" onClick={onAutoSuggest} style={{ fontSize: 10, padding: '2px 6px' }}>Auto-suggest</Button>
         <Tooltip title="Sort darkest first (embroidery order)" arrow>
-          <Button size="small" onClick={sortByLuminance} style={{ fontSize: 10, padding: '2px 6px' }}>
-            Sort ↕
-          </Button>
+          <Button size="small" onClick={sortByLuminance} style={{ fontSize: 10, padding: '2px 6px' }}>Sort ↕</Button>
         </Tooltip>
       </div>
     </div>
@@ -809,17 +821,13 @@ function AppDrawer(props) {
         <ListItem style={{ marginTop: -10 }}>
           <div style={{ width: '100%' }}>
             {props.multiColor ? (
-              <>
-                <Typography variant="caption" style={{ display: 'block', marginBottom: 2 }}>
-                  Thread colors (drag to reorder)
-                </Typography>
-                <ColorPaletteEditor
-                  colors={props.colors}
-                  numThreads={props.numThreads}
-                  onChange={colors => props.onChange({ colors })}
-                  onAutoSuggest={props.onAutoSuggest}
-                />
-              </>
+              <ColorPaletteEditor
+                colors={props.colors}
+                numThreads={props.numThreads}
+                threadPlan={props.threadPlan}
+                onChange={colors => props.onChange({ colors })}
+                onAutoSuggest={props.onAutoSuggest}
+              />
             ) : (
               <div style={{ display: 'flex', alignItems: 'center' }}>
                 <Typography variant="caption" style={{ marginRight: 8 }}>Color</Typography>
