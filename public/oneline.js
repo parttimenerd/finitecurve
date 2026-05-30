@@ -1270,36 +1270,52 @@ function scanLineRuns(img, wc, t, vx, vy, px, py, spacing) {
   return runs;
 }
 
-// Satin stitch: parallel slightly-curved lines along dominant axis, boustrophedon.
-// Lines are connected end-to-end (one continuous stroke). Step between scan lines
-// varies with local luminance — dark areas get denser lines (smaller step), light
-// areas get sparser lines (larger step). Each stitch bows slightly perpendicular
-// to give a curved/fabric feel; bow alternates direction each row.
+// BFS flood-fill on foreground pixels, returns array of pixel indices.
+function floodFillComponent(data, width, height, start, wc, visited) {
+  const queue = [start];
+  visited[start] = 1;
+  const pixels = [];
+  let head = 0;
+  while (head < queue.length) {
+    const idx = queue[head++];
+    pixels.push(idx);
+    const x = idx % width, y = (idx / width) | 0;
+    const nb = [];
+    if (x > 0) nb.push(idx - 1);
+    if (x < width - 1) nb.push(idx + 1);
+    if (y > 0) nb.push(idx - width);
+    if (y < height - 1) nb.push(idx + width);
+    for (const ni of nb) {
+      if (!visited[ni] && data[ni] < wc) { visited[ni] = 1; queue.push(ni); }
+    }
+  }
+  return pixels;
+}
+
+// Satin stitch: per-component — each connected foreground blob gets its own
+// dominant axis (PCA), then boustrophedon curved parallel lines fill it.
+// All components are concatenated into one continuous path with M jumps between them.
 function buildSatin(img, config) {
   const wc = config.whiteCutoff != null ? config.whiteCutoff : 240;
   const { pixels: data, width, height } = img;
-  const pts = collectForeground(img, wc);
-  if (pts.length === 0) return '';
 
-  const [vx, vy] = dominantAxis(pts);
-  const px = -vy, py = vx; // perpendicular direction
+  // Find connected components
+  const visited = new Uint8Array(width * height);
+  const components = [];
+  for (let i = 0; i < width * height; i++) {
+    if (data[i] < wc && !visited[i]) {
+      components.push(floodFillComponent(data, width, height, i, wc, visited));
+    }
+  }
+  if (components.length === 0) return '';
 
   const baseSpacing = Math.max(config.strokeWidth, Math.round(config.pointDensity * 0.6));
   const minStep = Math.max(1, Math.ceil(config.strokeWidth));
   const maxStep = Math.round(baseSpacing * 2.5);
-  // Bow: max perpendicular deflection as fraction of stitch half-length
   const bowFrac = 0.18;
 
-  // Find T extent
-  let minT = Infinity, maxT = -Infinity;
-  for (const p of pts) {
-    const t = p.x * px + p.y * py;
-    if (t < minT) minT = t;
-    if (t > maxT) maxT = t;
-  }
-
-  // Average foreground luminance along scan line at t (sampled every 3px)
-  function avgLumAtT(t) {
+  // Average luminance along a scan line in this component's image subset
+  function avgLumAtT(t, px, py, vx, vy) {
     let sum = 0, count = 0;
     const maxS = Math.max(width * Math.abs(vx), height * Math.abs(vy)) * 1.5;
     for (let si = -maxS; si <= maxS; si += 3) {
@@ -1313,137 +1329,130 @@ function buildSatin(img, config) {
     return count > 0 ? sum / count : wc - 1;
   }
 
-  let d = '';
-  let prevEndX = null, prevEndY = null;
-  let lineIdx = 0;
-  let t = minT;
+  let fullD = '';
 
-  while (t <= maxT) {
-    const runs = scanLineRuns(img, wc, t, vx, vy, px, py, baseSpacing);
+  for (const compPixels of components) {
+    if (compPixels.length < 4) continue; // skip dust
+    const pts = compPixels.map(i => ({ x: i % width, y: (i / width) | 0 }));
 
-    if (runs.length > 0) {
-      const forward = (lineIdx % 2 === 0);
-      const bowSign = (lineIdx % 2 === 0) ? 1 : -1; // alternate bow direction
-      const orderedRuns = forward ? runs : [...runs].reverse();
+    const [vx, vy] = dominantAxis(pts);
+    const px = -vy, py = vx;
 
-      for (const [ra, rb] of orderedRuns) {
-        const s0 = forward ? ra : rb, s1 = forward ? rb : ra;
-        const x0 = s0 * vx + t * px, y0 = s0 * vy + t * py;
-        const x1 = s1 * vx + t * px, y1 = s1 * vy + t * py;
-
-        if (prevEndX !== null) {
-          // Always connect with L — the short connector between adjacent satin lines
-          // is an intentional tie-off stitch in real embroidery. Only jump (M) when
-          // previous run was from a completely different scan group (prevEndX was null
-          // at start of this group), which is handled by the else branch below.
-          d += `L ${x0.toFixed(1)} ${y0.toFixed(1)}\n`;
-        } else {
-          d += `M ${x0.toFixed(1)} ${y0.toFixed(1)}\n`;
-        }
-
-        // Curved stitch: quadratic bezier with control point bowing perpendicular
-        const halfLen = (s1 - s0) / 2;
-        const midS = (s0 + s1) / 2;
-        const bow = bowSign * halfLen * bowFrac;
-        const cpx = midS * vx + (t + bow) * px;
-        const cpy = midS * vy + (t + bow) * py;
-        d += `Q ${cpx.toFixed(1)} ${cpy.toFixed(1)} ${x1.toFixed(1)} ${y1.toFixed(1)}\n`;
-
-        prevEndX = x1; prevEndY = y1;
-      }
-      lineIdx++;
-    } else {
-      prevEndX = null;
+    // T extent for this component
+    let minT = Infinity, maxT = -Infinity;
+    for (const p of pts) {
+      const t = p.x * px + p.y * py;
+      if (t < minT) minT = t;
+      if (t > maxT) maxT = t;
     }
 
-    // Variable step: dark→minStep, light→maxStep
-    const lum = avgLumAtT(t);
-    const frac = lum / (wc - 1);
-    const step = Math.round(minStep + frac * (maxStep - minStep));
-    t += Math.max(1, step);
+    let d = '';
+    let prevEndX = null, prevEndY = null;
+    let lineIdx = 0;
+    let t = minT;
+
+    while (t <= maxT) {
+      const runs = scanLineRuns(img, wc, t, vx, vy, px, py, baseSpacing);
+
+      if (runs.length > 0) {
+        const forward = (lineIdx % 2 === 0);
+        const bowSign = forward ? 1 : -1;
+        const orderedRuns = forward ? runs : [...runs].reverse();
+
+        for (const [ra, rb] of orderedRuns) {
+          const s0 = forward ? ra : rb, s1 = forward ? rb : ra;
+          const x0 = s0 * vx + t * px, y0 = s0 * vy + t * py;
+          const x1 = s1 * vx + t * px, y1 = s1 * vy + t * py;
+
+          d += prevEndX !== null
+            ? `L ${x0.toFixed(1)} ${y0.toFixed(1)}\n`
+            : `M ${x0.toFixed(1)} ${y0.toFixed(1)}\n`;
+
+          const halfLen = (s1 - s0) / 2;
+          const midS = (s0 + s1) / 2;
+          const bow = bowSign * halfLen * bowFrac;
+          const cpx = midS * vx + (t + bow) * px;
+          const cpy = midS * vy + (t + bow) * py;
+          d += `Q ${cpx.toFixed(1)} ${cpy.toFixed(1)} ${x1.toFixed(1)} ${y1.toFixed(1)}\n`;
+
+          prevEndX = x1; prevEndY = y1;
+        }
+        lineIdx++;
+      } else {
+        prevEndX = null;
+      }
+
+      const lum = avgLumAtT(t, px, py, vx, vy);
+      const frac = lum / (wc - 1);
+      const step = Math.round(minStep + frac * (maxStep - minStep));
+      t += Math.max(1, step);
+    }
+
+    if (d) fullD += d;
   }
-  return d;
+
+  return fullD;
 }
 
-// Fill stitch: boustrophedon horizontal rows with tone-modulated stitch length.
-// Dark pixels → full-length stitches; lighter pixels → shorter stitches with gaps.
-// This creates tonal shading characteristic of real fill embroidery.
+// Fill stitch: boustrophedon horizontal rows. Row spacing varies by local luminance
+// so dark areas get denser coverage. Each row is one unbroken horizontal span.
+// Rows within each component are connected end-to-end; components separated by M.
 function buildFill(img, config) {
   const wc = config.whiteCutoff != null ? config.whiteCutoff : 240;
   const { pixels: data, width, height } = img;
-  // Spacing tied to density: higher density → finer rows
-  const spacing = Math.max(2, Math.round(config.pointDensity * 0.6));
-  // Stitch pitch: distance between individual stitches within a run
-  const pitch = Math.max(3, spacing * 2);
+
+  const minSpacing = Math.max(2, Math.ceil(config.strokeWidth));
+  const maxSpacing = Math.max(minSpacing + 1, Math.round(config.pointDensity * 1.2));
 
   let d = '';
   let prevEndX = null, prevEndY = null;
   let rowIdx = 0;
 
-  for (let y = 0; y < height; y += spacing) {
-    // Find contiguous foreground runs on this row
+  let y = 0;
+  while (y < height) {
+    // Foreground runs on this row
     const runs = [];
     let runStart = -1;
     for (let x = 0; x < width; x++) {
       const fg = data[y * width + x] < wc;
-      if (fg && runStart < 0) { runStart = x; }
+      if (fg && runStart < 0) runStart = x;
       else if (!fg && runStart >= 0) { runs.push([runStart, x - 1]); runStart = -1; }
     }
     if (runStart >= 0) runs.push([runStart, width - 1]);
-    if (runs.length === 0) { prevEndX = null; continue; }
+
+    if (runs.length === 0) {
+      prevEndX = null;
+      y++;
+      continue;
+    }
 
     const forward = (rowIdx % 2 === 0);
     const orderedRuns = forward ? runs : [...runs].reverse();
 
     for (const [ra, rb] of orderedRuns) {
-      // Emit individual stitches within the run, length modulated by local darkness
-      const xStart = forward ? ra : rb;
-      const xEnd   = forward ? rb : ra;
-      const step   = forward ? pitch : -pitch;
+      const x0 = forward ? ra : rb;
+      const x1 = forward ? rb : ra;
 
-      let x = xStart;
-      let stitchStart = null;
-
-      while (forward ? x <= xEnd : x >= xEnd) {
-        const px = Math.round(x);
-        const lum = (px >= 0 && px < width) ? data[y * width + px] : wc;
-        const inFg = lum < wc;
-        // Stitch length fraction: 0 (lum near wc-1) → 1 (lum=0). Clamp to [0.15,1].
-        const frac = inFg ? Math.max(0.15, 1 - lum / (wc - 1)) : 0;
-        // Include pixel in current stitch if frac > 0.3 (mid-tone threshold)
-        const include = frac > 0.3;
-
-        if (include && stitchStart === null) {
-          stitchStart = x;
-        } else if (!include && stitchStart !== null) {
-          // Emit stitch from stitchStart to x-step
-          const sx = stitchStart, ex = x - step;
-          if (prevEndX !== null) {
-            const cmd = lineCmd(prevEndX, prevEndY, sx, y, data, width, height, wc);
-            d += `${cmd} ${sx} ${y}\n`;
-          } else {
-            d += `M ${sx} ${y}\n`;
-          }
-          d += `L ${ex} ${y}\n`;
-          prevEndX = ex; prevEndY = y;
-          stitchStart = null;
-        }
-        x += step;
+      if (prevEndX !== null) {
+        const cmd = lineCmd(prevEndX, prevEndY, x0, y, data, width, height, wc);
+        d += `${cmd} ${x0} ${y}\n`;
+      } else {
+        d += `M ${x0} ${y}\n`;
       }
-      // Flush remaining stitch
-      if (stitchStart !== null) {
-        const sx = stitchStart, ex = xEnd;
-        if (prevEndX !== null) {
-          const cmd = lineCmd(prevEndX, prevEndY, sx, y, data, width, height, wc);
-          d += `${cmd} ${sx} ${y}\n`;
-        } else {
-          d += `M ${sx} ${y}\n`;
-        }
-        d += `L ${ex} ${y}\n`;
-        prevEndX = ex; prevEndY = y;
-      }
+      d += `L ${x1} ${y}\n`;
+      prevEndX = x1; prevEndY = y;
     }
     rowIdx++;
+
+    // Row spacing: sample average luminance across this row's foreground pixels.
+    // Dark row (lum≈0) → minSpacing, light row (lum≈wc-1) → maxSpacing.
+    let lumSum = 0, lumCount = 0;
+    for (const [ra, rb] of runs) {
+      for (let x = ra; x <= rb; x++) { lumSum += data[y * width + x]; lumCount++; }
+    }
+    const avgLum = lumCount > 0 ? lumSum / lumCount : wc - 1;
+    const frac = avgLum / (wc - 1);
+    y += Math.max(minSpacing, Math.round(minSpacing + frac * (maxSpacing - minSpacing)));
   }
   return d;
 }

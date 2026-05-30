@@ -1208,6 +1208,10 @@ function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSu
 // The overlay is positioned absolute at 0,0 on top of the image element.
 function PainterOverlay({ width, height, imgWidth, imgHeight, rgbaData, colors, activePaintColor, paintTolerance, regionMask, onMaskChange }) {
   const canvasRef = React.useRef(null);
+  const isDragging = React.useRef(false);
+  const dragButton = React.useRef(0);
+  // Accumulate mask edits during a drag — flush to parent only on mouseup.
+  const dragMask = React.useRef(null);
 
   // Redraw the overlay canvas from the current regionMask.
   // Canvas DOM dimensions = imgWidth x imgHeight (1:1 with source image pixels).
@@ -1230,24 +1234,75 @@ function PainterOverlay({ width, height, imgWidth, imgHeight, rgbaData, colors, 
     ctx.putImageData(imageData, 0, 0);
   }, [regionMask, colors, imgWidth, imgHeight]);
 
-  function handlePaint(e) {
-    e.preventDefault();
+  function getImgCoords(e) {
     const canvas = canvasRef.current;
     const rect = canvas.getBoundingClientRect();
-    // rect is in CSS display pixels (after MapInteractionCSS transform).
-    // canvas.width is in source image pixels. Convert:
     const cssToImg = imgWidth / rect.width;
     const ix = Math.round((e.clientX - rect.left) * cssToImg);
     const iy = Math.round((e.clientY - rect.top) * cssToImg);
-    if (ix < 0 || iy < 0 || ix >= imgWidth || iy >= imgHeight) return;
+    return [ix, iy];
+  }
 
-    const isErase = e.button === 2 || e.ctrlKey;
+  function applyFill(e, mask) {
+    const [ix, iy] = getImgCoords(e);
+    if (ix < 0 || iy < 0 || ix >= imgWidth || iy >= imgHeight) return mask;
+    const isErase = dragButton.current === 2 || e.ctrlKey;
     const filled = smartFill(rgbaData, imgWidth, imgHeight, ix, iy, paintTolerance);
-    const newMask = regionMask ? regionMask.slice() : new Int8Array(imgWidth * imgHeight).fill(-1);
+    const newMask = mask ? mask.slice() : new Int8Array(imgWidth * imgHeight).fill(-1);
     for (let i = 0; i < filled.length; i++) {
       if (filled[i]) newMask[i] = isErase ? -1 : activePaintColor;
     }
-    onMaskChange(newMask);
+    return newMask;
+  }
+
+  function handleMouseDown(e) {
+    e.preventDefault();
+    isDragging.current = true;
+    dragButton.current = e.button;
+    const newMask = applyFill(e, regionMask);
+    dragMask.current = newMask;
+    // Update canvas immediately for visual feedback without triggering rebuild
+    redrawCanvas(newMask);
+  }
+
+  function handleMouseMove(e) {
+    if (!isDragging.current) return;
+    e.preventDefault();
+    const newMask = applyFill(e, dragMask.current);
+    dragMask.current = newMask;
+    redrawCanvas(newMask);
+  }
+
+  function handleMouseUp(e) {
+    if (!isDragging.current) return;
+    isDragging.current = false;
+    if (dragMask.current) {
+      onMaskChange(dragMask.current);
+      dragMask.current = null;
+    }
+  }
+
+  function redrawCanvas(mask) {
+    const canvas = canvasRef.current;
+    if (!canvas || !mask) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, imgWidth, imgHeight);
+    const imageData = ctx.createImageData(imgWidth, imgHeight);
+    const out = imageData.data;
+    for (let i = 0; i < imgWidth * imgHeight; i++) {
+      const assignment = mask[i];
+      if (assignment < 0) continue;
+      const hex = colors[assignment]?.hex || '#888888';
+      const n = parseInt((typeof hex === 'string' ? hex : '#' + hex.hex).replace('#', ''), 16);
+      const oi = i * 4;
+      out[oi] = (n >> 16) & 255; out[oi + 1] = (n >> 8) & 255; out[oi + 2] = n & 255; out[oi + 3] = 150;
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }
+
+  function handleContextMenu(e) {
+    e.preventDefault();
+    // Right-click handled via mousedown
   }
 
   return (
@@ -1255,8 +1310,11 @@ function PainterOverlay({ width, height, imgWidth, imgHeight, rgbaData, colors, 
       ref={canvasRef}
       width={imgWidth}
       height={imgHeight}
-      onClick={handlePaint}
-      onContextMenu={handlePaint}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onMouseLeave={handleMouseUp}
+      onContextMenu={handleContextMenu}
       style={{
         position: 'absolute', top: 0, left: 0,
         width: width + 'px', height: height + 'px',

@@ -321,14 +321,14 @@ export function applyRegionMask(channels, mask, rgbaData, width, height) {
 }
 
 // Intelligent flood-fill: starting from pixel (sx, sy), expand to all connected pixels
-// whose color (in RGBA data) is within `tolerance` of the seed pixel's color (Euclidean
-// distance in RGB space). Returns Int8Array regionMask fragment (size=w*h) with 1 where
-// filled, 0 elsewhere.
+// whose color (in RGBA data) is within `tolerance` of the seed pixel's color.
+// Uses 8-connectivity (includes diagonals) to avoid staircase artifacts.
+// Returns Uint8Array (size=w*h) with 1 where filled, 0 elsewhere.
 export function smartFill(rgbaData, width, height, sx, sy, tolerance) {
   const size = width * height;
-  const result = new Uint8Array(size); // 1 = filled
+  const result = new Uint8Array(size);
   const idx0 = sy * width + sx;
-  if (rgbaData[idx0 * 4 + 3] < 128) return result; // transparent seed
+  if (rgbaData[idx0 * 4 + 3] < 128) return result;
 
   const sr = rgbaData[idx0 * 4], sg = rgbaData[idx0 * 4 + 1], sb = rgbaData[idx0 * 4 + 2];
   const tolSq = tolerance * tolerance;
@@ -342,20 +342,20 @@ export function smartFill(rgbaData, width, height, sx, sy, tolerance) {
   while (head < queue.length) {
     const idx = queue[head++];
     const x = idx % width, y = (idx / width) | 0;
-    const neighbors = [];
-    if (x > 0) neighbors.push(idx - 1);
-    if (x < width - 1) neighbors.push(idx + 1);
-    if (y > 0) neighbors.push(idx - width);
-    if (y < height - 1) neighbors.push(idx + width);
-    for (const ni of neighbors) {
-      if (visited[ni]) continue;
-      visited[ni] = 1;
-      const a = rgbaData[ni * 4 + 3];
-      if (a < 128) continue;
-      const dr = rgbaData[ni * 4] - sr, dg = rgbaData[ni * 4 + 1] - sg, db = rgbaData[ni * 4 + 2] - sb;
-      if (dr * dr + dg * dg + db * db <= tolSq) {
-        result[ni] = 1;
-        queue.push(ni);
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const ni = ny * width + nx;
+        if (visited[ni]) continue;
+        visited[ni] = 1;
+        if (rgbaData[ni * 4 + 3] < 128) continue;
+        const dr = rgbaData[ni * 4] - sr, dg = rgbaData[ni * 4 + 1] - sg, db = rgbaData[ni * 4 + 2] - sb;
+        if (dr * dr + dg * dg + db * db <= tolSq) {
+          result[ni] = 1;
+          queue.push(ni);
+        }
       }
     }
   }
