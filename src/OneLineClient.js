@@ -136,6 +136,7 @@ function buildMulti(threads, commonOptions) {
       data: gsCopy,
       width,
       height,
+      stitchMode: threads[i].stitchMode || 'oneline',
       options: JSON.stringify(commonOptions),
     }, [gsCopy.buffer]);
   }

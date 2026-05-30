@@ -302,6 +302,66 @@ export function splitChannelAtConnector(channel, width, height, x0, y0, x1, y1) 
   }
   return [chA, chB];
 }
+// Override automatic color separation with a manually painted region mask.
+// mask: Int8Array of length width*height, value -1=auto, 0..n-1=forced assignment.
+// channels: array of N Uint8Arrays produced by separateColors (mutated in place).
+export function applyRegionMask(channels, mask, rgbaData, width, height) {
+  const n = channels.length;
+  for (let i = 0; i < width * height; i++) {
+    const assignment = mask[i];
+    if (assignment < 0) continue; // auto
+    // Move this pixel to the assigned channel; clear it from all others.
+    const lum = Math.round(
+      0.299 * rgbaData[i * 4] + 0.587 * rgbaData[i * 4 + 1] + 0.114 * rgbaData[i * 4 + 2]
+    );
+    for (let k = 0; k < n; k++) {
+      channels[k][i] = k === assignment ? lum : 255;
+    }
+  }
+}
+
+// Intelligent flood-fill: starting from pixel (sx, sy), expand to all connected pixels
+// whose color (in RGBA data) is within `tolerance` of the seed pixel's color (Euclidean
+// distance in RGB space). Returns Int8Array regionMask fragment (size=w*h) with 1 where
+// filled, 0 elsewhere.
+export function smartFill(rgbaData, width, height, sx, sy, tolerance) {
+  const size = width * height;
+  const result = new Uint8Array(size); // 1 = filled
+  const idx0 = sy * width + sx;
+  if (rgbaData[idx0 * 4 + 3] < 128) return result; // transparent seed
+
+  const sr = rgbaData[idx0 * 4], sg = rgbaData[idx0 * 4 + 1], sb = rgbaData[idx0 * 4 + 2];
+  const tolSq = tolerance * tolerance;
+
+  const visited = new Uint8Array(size);
+  const queue = [idx0];
+  visited[idx0] = 1;
+  result[idx0] = 1;
+  let head = 0;
+
+  while (head < queue.length) {
+    const idx = queue[head++];
+    const x = idx % width, y = (idx / width) | 0;
+    const neighbors = [];
+    if (x > 0) neighbors.push(idx - 1);
+    if (x < width - 1) neighbors.push(idx + 1);
+    if (y > 0) neighbors.push(idx - width);
+    if (y < height - 1) neighbors.push(idx + width);
+    for (const ni of neighbors) {
+      if (visited[ni]) continue;
+      visited[ni] = 1;
+      const a = rgbaData[ni * 4 + 3];
+      if (a < 128) continue;
+      const dr = rgbaData[ni * 4] - sr, dg = rgbaData[ni * 4 + 1] - sg, db = rgbaData[ni * 4 + 2] - sb;
+      if (dr * dr + dg * dg + db * db <= tolSq) {
+        result[ni] = 1;
+        queue.push(ni);
+      }
+    }
+  }
+  return result;
+}
+
 // Returns [{hex, colorIndex, sliceIndex, totalSlices, pixelCount}], sorted by
 // embroidery order (color order preserved, slices within a color largest-first).
 export function computeThreadPlan(colors, channels, width, height, totalThreads) {

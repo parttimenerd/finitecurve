@@ -7,6 +7,8 @@ import FormControlLabel from "@material-ui/core/FormControlLabel";
 import Grid from "@material-ui/core/Grid";
 import { makeStyles } from '@material-ui/core/styles';
 import { withStyles } from '@material-ui/core/styles';
+import Menu from "@material-ui/core/Menu";
+import MenuItem from "@material-ui/core/MenuItem";
 import Slider from "@material-ui/core/Slider";
 import Tooltip from "@material-ui/core/Tooltip";
 import Typography from "@material-ui/core/Typography";
@@ -23,7 +25,7 @@ import exDog from './examples/dog.jpg';
 import exWorld from './examples/world.png';
 
 import OneLineClient from './OneLineClient.js';
-import { separateColors, findLongestSegment, splitChannelAtConnector } from './colorSeparate.js';
+import { separateColors, applyRegionMask, smartFill, findLongestSegment, splitChannelAtConnector } from './colorSeparate.js';
 
 import './App.css';
 window.React = React;
@@ -372,6 +374,10 @@ class App extends React.Component {
       showOriginal: false,
       segPreviewUrl: null,
       showSegPreview: false,
+      paintMode: false,
+      activePaintColor: 0,
+      paintTolerance: 40,
+      regionMask: null, // Int8Array, -1=auto, 0..n-1=forced
     };
     OneLineClient.onResult = d => this.processResult(this, d);
   }
@@ -390,6 +396,7 @@ class App extends React.Component {
       invert: false,
       edgeStrength: 0,
       maxDensity: 10,
+      lockDensity: false,
       multiColor: true,
       numColors: 6,
       vibrancy: 50,
@@ -397,6 +404,11 @@ class App extends React.Component {
       fg: "#000000",
       colors: DEFAULT_COLORS.map(c => ({ ...c })),
       bg: "white",
+      jitterStrength: 0,
+      noiseAmplitude: 0,
+      fractalAmplitude: 0,
+      controlPointNoise: 0,
+      edgeWander: 0,
     };
   }
 
@@ -438,7 +450,7 @@ class App extends React.Component {
     // Create a stable object URL for the original image (for compare overlay).
     if (this.state.originalImageUrl) URL.revokeObjectURL(this.state.originalImageUrl);
     const originalImageUrl = URL.createObjectURL(new Blob([event.data]));
-    this.setState({ originalImageUrl, showOriginal: false });
+    this.setState({ originalImageUrl, showOriginal: false, regionMask: null });
 
     decodeImageRGBA(event.data).then(decoded => {
       this._lastDecodedImage = decoded;
@@ -466,8 +478,12 @@ class App extends React.Component {
 
       if (multiColor) {
         const channels = separateColors(rgbaData, width, height, colors);
+        if (this.state.regionMask) {
+          applyRegionMask(channels, this.state.regionMask, rgbaData, width, height);
+        }
         const threads = colors.map((c, i) => ({
           hex: this.toHexColor(c.hex),
+          stitchMode: c.stitchMode || 'oneline',
           grayscaleChannel: channels[i],
           width,
           height,
@@ -757,6 +773,7 @@ class App extends React.Component {
 
   render() {
     const { classes } = this.props;
+    const { paintMode, activePaintColor, paintTolerance, regionMask } = this.state;
     return (
       <div className={classes.root}>
         <AppDrawer
@@ -778,18 +795,44 @@ class App extends React.Component {
           canSegPreview={!!this._lastDecodedImage}
           showOriginal={this.state.showOriginal}
           showSegPreview={this.state.showSegPreview}
+          paintMode={paintMode}
+          activePaintColor={activePaintColor}
+          paintTolerance={paintTolerance}
+          hasPaintMask={!!(regionMask && regionMask.some(v => v >= 0))}
+          canPaint={!!this._lastDecodedImage && this.state.controls.multiColor}
+          onTogglePaint={() => this.setState(s => ({ paintMode: !s.paintMode }))}
+          onSetActivePaintColor={i => this.setState({ activePaintColor: i })}
+          onSetPaintTolerance={t => this.setState({ paintTolerance: t })}
+          onClearPaintMask={() => { this.setState({ regionMask: null }); setTimeout(() => this.startBuild(), 0); }}
         />
         <div className={classes.content} id="content" style={{ backgroundColor: this.state.background }}>
           <Typography className={classes.toast}>{this.getToastMessage()}</Typography>
           <Typography className={classes.stats}>{this.getStats()}</Typography>
           {!this.state.showSegPreview && this.getUiStateElement(this.state.ui)}
-          <MapInteractionCSS value={this.state.map} onChange={(c) => this.setState({ map: c })}>
+          <MapInteractionCSS value={this.state.map} onChange={(c) => { if (!paintMode) this.setState({ map: c }); }}>
             <img src={this.state.showSegPreview && this.state.segPreviewUrl ? this.state.segPreviewUrl : this.state.url}
                  width={this.state.width + "px"} height={this.state.height + "px"} alt="" />
             {!this.state.showSegPreview && this.state.showOriginal && this.state.originalImageUrl &&
               <img src={this.state.originalImageUrl} width={this.state.width + "px"} height={this.state.height + "px"} alt="original"
                 style={{ position: 'absolute', top: 0, left: 0, opacity: 0.5, pointerEvents: 'none' }} />
             }
+            {paintMode && this._lastDecodedImage && (
+              <PainterOverlay
+                width={this.state.width}
+                height={this.state.height}
+                imgWidth={this._lastDecodedImage.width}
+                imgHeight={this._lastDecodedImage.height}
+                rgbaData={this._lastDecodedImage.rgbaData}
+                colors={this.state.controls.colors}
+                activePaintColor={activePaintColor}
+                paintTolerance={paintTolerance}
+                regionMask={regionMask}
+                onMaskChange={mask => {
+                  this.setState({ regionMask: mask });
+                  setTimeout(() => this.startBuild(), 0);
+                }}
+              />
+            )}
           </MapInteractionCSS>
         </div>
       </div>
@@ -935,6 +978,16 @@ function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSu
   const MIN_COLORS = 1;
   const dragIdxRef = React.useRef(null);
   const [dragOver, setDragOver] = React.useState(null);
+  const [menuAnchor, setMenuAnchor] = React.useState(null);
+  const [menuIndex, setMenuIndex] = React.useState(null);
+
+  const STITCH_MODES = ['oneline', 'satin', 'fill', 'running', 'cross'];
+  const modeLabel = m => ({ oneline: 'One-line', satin: 'Satin', fill: 'Fill stitch', running: 'Running stitch', cross: 'Cross-stitch' })[m] || m;
+  const modeBadge = m => ({ oneline: '∿', satin: '⋮', fill: '≡', running: '- -', cross: '✕' })[m] || '∿';
+
+  function updateStitchMode(index, mode) {
+    onChange(colors.map((c, i) => i === index ? { ...c, stitchMode: mode } : c));
+  }
 
   function addColor() {
     if (colors.length >= MAX_COLORS) return;
@@ -1045,6 +1098,7 @@ function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSu
             onDragOver={e => handleDragOver(e, i)}
             onDrop={e => handleDrop(e, i)}
             onDragEnd={handleDragEnd}
+            onContextMenu={e => { e.preventDefault(); setMenuAnchor(e.currentTarget); setMenuIndex(i); }}
             style={{
               position: 'relative', display: 'inline-flex', flexDirection: 'column',
               alignItems: 'center', cursor: 'grab',
@@ -1073,12 +1127,27 @@ function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSu
                 </Tooltip>
               )}
             </div>
+            <div style={{ fontSize: 7, textAlign: 'center', lineHeight: 1.2, color: '#666', userSelect: 'none' }}>
+              {modeBadge(c.stitchMode || 'oneline')}
+            </div>
           </div>
         ))}
         {colors.length < MAX_COLORS && (
           <Button onClick={addColor} style={{ minWidth: 24, padding: '2px 4px', fontSize: 16, lineHeight: 1, alignSelf: 'flex-start' }}>+</Button>
         )}
       </div>
+      <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={() => setMenuAnchor(null)}>
+        {STITCH_MODES.map(mode => (
+          <MenuItem
+            key={mode}
+            selected={(colors[menuIndex]?.stitchMode || 'oneline') === mode}
+            onClick={() => { updateStitchMode(menuIndex, mode); setMenuAnchor(null); }}
+          >
+            <span style={{ marginRight: 8, fontSize: 12 }}>{modeBadge(mode)}</span>
+            {modeLabel(mode)}
+          </MenuItem>
+        ))}
+      </Menu>
 
       {/* ── Thread order (actual build passes) ── */}
       <Typography variant="caption" style={{ display: 'block', marginTop: 8, marginBottom: 2, color: '#555' }}>
@@ -1133,6 +1202,71 @@ function ColorPaletteEditor({ colors, numThreads, threadPlan, onChange, onAutoSu
   );
 }
 
+// ─── PainterOverlay ───────────────────────────────────────────────────────────
+// Canvas overlay that sits on top of the SVG result. Click or drag to paint
+// regions; uses smart flood-fill (stops at color edges in the original image).
+// The overlay is positioned absolute at 0,0 on top of the image element.
+function PainterOverlay({ width, height, imgWidth, imgHeight, rgbaData, colors, activePaintColor, paintTolerance, regionMask, onMaskChange }) {
+  const canvasRef = React.useRef(null);
+
+  // Redraw the overlay canvas from the current regionMask.
+  // Canvas DOM dimensions = imgWidth x imgHeight (1:1 with source image pixels).
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, imgWidth, imgHeight);
+    if (!regionMask) return;
+    const imageData = ctx.createImageData(imgWidth, imgHeight);
+    const out = imageData.data;
+    for (let i = 0; i < imgWidth * imgHeight; i++) {
+      const assignment = regionMask[i];
+      if (assignment < 0) continue;
+      const hex = colors[assignment]?.hex || '#888888';
+      const n = parseInt((typeof hex === 'string' ? hex : '#' + hex.hex).replace('#', ''), 16);
+      const oi = i * 4;
+      out[oi] = (n >> 16) & 255; out[oi + 1] = (n >> 8) & 255; out[oi + 2] = n & 255; out[oi + 3] = 150;
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }, [regionMask, colors, imgWidth, imgHeight]);
+
+  function handlePaint(e) {
+    e.preventDefault();
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    // rect is in CSS display pixels (after MapInteractionCSS transform).
+    // canvas.width is in source image pixels. Convert:
+    const cssToImg = imgWidth / rect.width;
+    const ix = Math.round((e.clientX - rect.left) * cssToImg);
+    const iy = Math.round((e.clientY - rect.top) * cssToImg);
+    if (ix < 0 || iy < 0 || ix >= imgWidth || iy >= imgHeight) return;
+
+    const isErase = e.button === 2 || e.ctrlKey;
+    const filled = smartFill(rgbaData, imgWidth, imgHeight, ix, iy, paintTolerance);
+    const newMask = regionMask ? regionMask.slice() : new Int8Array(imgWidth * imgHeight).fill(-1);
+    for (let i = 0; i < filled.length; i++) {
+      if (filled[i]) newMask[i] = isErase ? -1 : activePaintColor;
+    }
+    onMaskChange(newMask);
+  }
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={imgWidth}
+      height={imgHeight}
+      onClick={handlePaint}
+      onContextMenu={handlePaint}
+      style={{
+        position: 'absolute', top: 0, left: 0,
+        width: width + 'px', height: height + 'px',
+        cursor: 'crosshair',
+        zIndex: 10,
+      }}
+    />
+  );
+}
+
 function AppDrawer(props) {
   const classes = madeStyles();
 
@@ -1158,7 +1292,25 @@ function AppDrawer(props) {
           <ParameterSlider min={0} max={100} value={props.edgeStrength} onChange={(e, c) => props.onChange({ edgeStrength: c })} title="Edge strength" tooltip="How much edges attract the line (0 = off)" />
         </ListItem>
         <ListItem>
-          <ParameterSlider min={1} max={30} value={props.maxDensity} onChange={(e, c) => props.onChange({ maxDensity: c })} title="Max density" tooltip="Minimum spacing between points — lower = denser lines in dark areas" />
+          <ParameterSlider min={0} max={100} step={1} value={props.jitterStrength} onChange={(e, c) => props.onChange({ jitterStrength: c })} title="Point jitter" tooltip="Randomly offset each point by up to N% of its local spacing — affects path topology" />
+        </ListItem>
+        <ListItem>
+          <ParameterSlider min={0} max={20} step={0.5} value={props.noiseAmplitude} onChange={(e, c) => props.onChange({ noiseAmplitude: c })} title="Path noise" tooltip="Perpendicular displacement of each output point along the path (cosmetic)" />
+        </ListItem>
+        <ListItem>
+          <ParameterSlider min={0} max={10} step={0.5} value={props.fractalAmplitude} onChange={(e, c) => props.onChange({ fractalAmplitude: c })} title="Fractal detail" tooltip="Recursive midpoint displacement on straight segments — adds fine texture (cosmetic)" />
+        </ListItem>
+        <ListItem>
+          <ParameterSlider min={0} max={20} step={0.5} value={props.controlPointNoise} onChange={(e, c) => props.onChange({ controlPointNoise: c })} title="Curve wobble" tooltip="Random noise on Bézier control points — makes curves bulge and wiggle (cosmetic)" />
+        </ListItem>
+        <ListItem>
+          <ParameterSlider min={0} max={100} step={1} value={props.edgeWander} onChange={(e, c) => props.onChange({ edgeWander: c })} title="Edge wander" tooltip="Bias fractal midpoints to follow detected edges — line wanders along contours" />
+        </ListItem>
+        <ListItem>
+          <ParameterSlider min={1} max={30} value={31 - props.maxDensity} onChange={(e, c) => props.onChange({ maxDensity: 31 - c })} title="Density" tooltip="Controls line spacing — lower = denser lines across all brightness areas" />
+        </ListItem>
+        <ListItem style={{ marginTop: -10 }}>
+          <ParameterCheckbox value={props.lockDensity} onChange={(e, c) => props.onChange({ lockDensity: c })} title="Lock density" tooltip="Keep visual fill constant when stroke width changes — density auto-adjusts with line width" />
         </ListItem>
         <ListItem style={{ marginTop: -10 }}>
           <ParameterCheckbox value={props.invert} onChange={(e, c) => props.onChange({ invert: c })} title="Invert image" tooltip="Fill white instead of black" />
@@ -1207,6 +1359,40 @@ function AppDrawer(props) {
         <Button variant="contained" color="primary" onClick={props.onDownloadPNG} className={classes.lowHighButton} disabled={!props.canDownload}>Download PNG</Button>
         <Button variant="contained" color={props.showOriginal ? "secondary" : "default"} onClick={props.onToggleCompare} className={classes.lowButton} disabled={!props.canCompare}>{props.showOriginal ? "Hide Original" : "Compare"}</Button>
         <Button variant="contained" color={props.showSegPreview ? "secondary" : "default"} onClick={props.onToggleSegPreview} className={classes.lowButton} disabled={!props.canSegPreview}>{props.showSegPreview ? "Show Render" : "Preview Colors"}</Button>
+        <Button variant="contained" color={props.paintMode ? "secondary" : "default"} onClick={props.onTogglePaint} className={classes.lowButton} disabled={!props.canPaint}>{props.paintMode ? "Done Painting" : "Paint Regions"}</Button>
+        {props.paintMode && (
+          <ListItem style={{ flexDirection: 'column', alignItems: 'flex-start', paddingTop: 4, paddingBottom: 4 }}>
+            <Typography variant="caption" style={{ color: '#555', marginBottom: 4 }}>Paint with color (click swatch):</Typography>
+            <Typography variant="caption" style={{ color: '#888', fontSize: 9, display: 'block', marginBottom: 4 }}>Left-click = assign · Right-click = erase</Typography>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+              {props.colors.map((c, i) => (
+                <div
+                  key={i}
+                  onClick={() => props.onSetActivePaintColor(i)}
+                  style={{
+                    width: 22, height: 22, borderRadius: 4,
+                    backgroundColor: typeof c.hex === 'string' ? c.hex : '#' + c.hex.hex,
+                    border: props.activePaintColor === i ? '3px solid #1976d2' : '2px solid rgba(0,0,0,0.2)',
+                    boxSizing: 'border-box', cursor: 'pointer',
+                  }}
+                />
+              ))}
+            </div>
+            <Typography variant="caption" style={{ color: '#555', marginBottom: 2 }}>
+              Tolerance: {props.paintTolerance}
+            </Typography>
+            <Slider
+              min={0} max={150} value={props.paintTolerance}
+              onChange={(e, v) => props.onSetPaintTolerance(v)}
+              style={{ width: drawerWidth - 48 }}
+            />
+            {props.hasPaintMask && (
+              <Button size="small" onClick={props.onClearPaintMask} style={{ marginTop: 4, fontSize: 10 }}>
+                Clear All Paint
+              </Button>
+            )}
+          </ListItem>
+        )}
         <Divider />
         <Button variant="contained" onClick={props.onFeedback} className={classes.lowButton}>Feedback / Issues</Button>
       </List>

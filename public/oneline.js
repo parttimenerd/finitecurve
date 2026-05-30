@@ -1,5 +1,79 @@
 'use strict';
 
+// ─── Seeded PRNG (mulberry32) ─────────────────────────────────────────────────
+
+function makePRNG(seed) {
+  let s = seed >>> 0;
+  return function() {
+    s += 0x6D2B79F5;
+    let z = s;
+    z = Math.imul(z ^ (z >>> 15), z | 1);
+    z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Displace point (ox,oy) perpendicular to segment (ax,ay)→(bx,by) by amount*sign.
+// t in [0,1] maps to sign: t<0.5 → negative side, t>0.5 → positive side.
+function perpDisplace(ox, oy, ax, ay, bx, by, amount, t) {
+  const dx = bx - ax, dy = by - ay;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 0.001) return [ox, oy];
+  const nx = -dy / len, ny = dx / len;
+  const d = (t * 2 - 1) * amount;
+  return [ox + nx * d, oy + ny * d];
+}
+
+// Edge-aware fractal subdivision: at each midpoint, blend perpendicular fractal displacement
+// with a displacement along the edge gradient direction (wandering along edges).
+// img may be null (no edge wander when edgeWander=0 or image unavailable).
+function fractalSubdivideEdge(x0, y0, x1, y1, depth, amplitude, edgeWander, rng, img) {
+  if (depth <= 0 || (amplitude < 0.5 && edgeWander <= 0)) return `L ${x1} ${y1}\n`;
+  const mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+
+  let px = mx, py = my;
+
+  // Fractal perpendicular component
+  if (amplitude >= 0.5) {
+    [px, py] = perpDisplace(px, py, x0, y0, x1, y1, amplitude, rng());
+  } else {
+    rng(); // consume RNG slot to keep sequence consistent
+  }
+
+  // Edge-wander component: displace midpoint along the edge gradient
+  if (edgeWander > 0 && img && img.edgeMap) {
+    const ix = Math.max(0, Math.min(img.width  - 1, Math.round(mx)));
+    const iy = Math.max(0, Math.min(img.height - 1, Math.round(my)));
+    const idx = iy * img.width + ix;
+    const eStrength = img.edgeMap[idx];
+    if (eStrength > 0.1) {
+      // Edge gradient direction points perpendicular to the edge.
+      // The edge *line* direction is the perpendicular of the gradient.
+      // We want to pull the midpoint toward the edge, i.e., along the gradient.
+      const gx = img.edgeGradX[idx], gy = img.edgeGradY[idx];
+      const glen = Math.sqrt(gx * gx + gy * gy);
+      if (glen > 0.001) {
+        // Edge tangent (rotate gradient 90°) — wander along the edge contour
+        const tx = -gy / glen, ty = gx / glen;
+        // Scale: use max(amplitude,2) so edge wander works even when fractalAmplitude=0
+        const baseScale = Math.max(amplitude, 2);
+        const wanderAmt = edgeWander / 100 * eStrength * baseScale * 2;
+        const sign = rng() > 0.5 ? 1 : -1;
+        px += tx * wanderAmt * sign;
+        py += ty * wanderAmt * sign;
+      } else {
+        rng();
+      }
+    } else {
+      rng();
+    }
+  }
+
+  const a2 = amplitude / 2;
+  return fractalSubdivideEdge(x0, y0, px, py, depth - 1, a2, edgeWander, rng, img)
+       + fractalSubdivideEdge(px, py, x1, y1, depth - 1, a2, edgeWander, rng, img);
+}
+
 // ─── Image ───────────────────────────────────────────────────────────────────
 
 class Image {
@@ -13,17 +87,20 @@ class Image {
     return this.pixels[y * this.width + x];
   }
 
-  // Blend edge map (Sobel) into pixel values so darker = more edges.
-  // strength 0–100: at 100, edge pixels become fully dark (0); non-edges untouched.
-  // Works in stored-pixel space (invert-aware: "dark" means dense lines).
-  applyEdgeBlend(strength, invert) {
-    if (strength <= 0) return;
+  // Compute normalized Sobel edge map, excluding background pixels (darkness > whiteCutoff).
+  // Returns Float32Array of edge strengths [0,1] and stores it as this.edgeMap.
+  // Also stores this.edgeGradX / this.edgeGradY (normalized gradient direction per pixel).
+  computeEdgeMap(invert, whiteCutoff) {
     const w = this.width, h = this.height, p = this.pixels;
-    const t = strength / 100;
     const edges = new Float32Array(w * h);
+    const gradX  = new Float32Array(w * h);
+    const gradY  = new Float32Array(w * h);
     let maxE = 0;
     for (let y = 1; y < h - 1; y++) {
       for (let x = 1; x < w - 1; x++) {
+        const shade = p[y * w + x];
+        const darkness = invert ? 255 - shade : shade;
+        if (darkness > whiteCutoff) continue;
         const gx =
           -p[(y-1)*w+(x-1)] - 2*p[y*w+(x-1)] - p[(y+1)*w+(x-1)] +
            p[(y-1)*w+(x+1)] + 2*p[y*w+(x+1)] + p[(y+1)*w+(x+1)];
@@ -32,16 +109,42 @@ class Image {
            p[(y+1)*w+(x-1)] + 2*p[(y+1)*w+x] + p[(y+1)*w+(x+1)];
         const e = Math.sqrt(gx*gx + gy*gy);
         edges[y*w+x] = e;
+        gradX[y*w+x] = gx;
+        gradY[y*w+x] = gy;
         if (e > maxE) maxE = e;
       }
     }
-    if (maxE === 0) return;
+    if (maxE > 0) {
+      for (let i = 0; i < w * h; i++) {
+        if (edges[i] > 0) {
+          edges[i] /= maxE;
+          gradX[i] /= maxE;
+          gradY[i] /= maxE;
+        }
+      }
+    }
+    this.edgeMap  = edges;
+    this.edgeGradX = gradX;
+    this.edgeGradY = gradY;
+    return edges;
+  }
+
+  // Blend edge map (Sobel) into pixel values so darker = more edges.
+  // strength 0–100: at 100, edge pixels become fully dark (0); non-edges untouched.
+  // Works in stored-pixel space (invert-aware: "dark" means dense lines).
+  // Background pixels (above whiteCutoff) are excluded from Sobel so region
+  // boundaries don't dominate normalization and drown out actual content edges.
+  applyEdgeBlend(strength, invert, whiteCutoff) {
+    const edges = this.computeEdgeMap(invert, whiteCutoff);
+    if (strength <= 0) return;
+    const w = this.width, h = this.height, p = this.pixels;
+    const t = strength / 100;
+    const darkVal = invert ? 255 : 0;
     for (let i = 0; i < w * h; i++) {
-      const edgeStrength = edges[i] / maxE; // 0=flat, 1=strong edge
-      // Edge pixels should appear "dark" (dense lines).
-      // In normal mode, dark = low value; in invert mode, dark = high value.
-      const darkVal = invert ? 255 : 0;
-      p[i] = Math.round(p[i] * (1 - t * edgeStrength) + darkVal * t * edgeStrength);
+      const shade = p[i];
+      const darkness = invert ? 255 - shade : shade;
+      if (darkness > whiteCutoff) continue;
+      p[i] = Math.round(shade * (1 - t * edges[i]) + darkVal * t * edges[i]);
     }
   }
 
@@ -344,6 +447,7 @@ class Points {
 
   fillRandom(image) {
     const cfg = this.config;
+    const rng = cfg.jitterStrength > 0 ? makePRNG(cfg.seed ^ 0xDEAD0001) : null;
     for (let y = 0; y < cfg.height; y++) {
       for (let x = 0; x < cfg.width; x++) {
         const shade = image.getShade(x, y);
@@ -358,6 +462,11 @@ class Points {
           // The original ratio neighborhood/pointDensity collapses at small scale
           // when pointDensity > neighborhood (e.g. high maxDensity, low resolution).
           p.reach = Math.max(Math.ceil(d * 1.5), Math.round(d * cfg.neighborhood / cfg.pointDensity));
+          if (rng) {
+            const radius = d * cfg.jitterStrength / 100;
+            p.x = Math.max(0, Math.min(cfg.width  - 1, Math.round(p.x + (rng() * 2 - 1) * radius)));
+            p.y = Math.max(0, Math.min(cfg.height - 1, Math.round(p.y + (rng() * 2 - 1) * radius)));
+          }
           x += d - 1;
         }
       }
@@ -462,9 +571,10 @@ class Points {
   }
 
   shuffleNeighbors() {
+    const rng = makePRNG(this.config.seed ^ 0xF00D0004);
     for (const p of this.points) {
       for (let i = p.neighbors.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
+        const j = Math.floor(rng() * (i + 1));
         [p.neighbors[i], p.neighbors[j]] = [p.neighbors[j], p.neighbors[i]];
       }
     }
@@ -950,8 +1060,9 @@ class Points {
 
   outputSVG() {
     const cfg = this.config;
+    const dash = cfg.stitchMode === 'running' ? ` stroke-dasharray='8 4'` : '';
     let out = `<svg viewbox='0 0 ${cfg.width} ${cfg.height}' width='${cfg.width}' height='${cfg.height}' xmlns='http://www.w3.org/2000/svg'>\n`;
-    out += `<path stroke='black' fill='none' stroke-width='${cfg.strokeWidth}' d='\n`;
+    out += `<path stroke='black' fill='none' stroke-width='${cfg.strokeWidth}'${dash} d='\n`;
     if (cfg.smoothPath) {
       out += this.outputSVGCubic();
     } else {
@@ -963,7 +1074,11 @@ class Points {
 
   outputSVGLinear() {
     const pts = this.points;
-    const maxReachSq = this.config.maxReach * this.config.maxReach;
+    const cfg = this.config;
+    const maxReachSq = cfg.maxReach * cfg.maxReach;
+    const anyEffect = cfg.noiseAmplitude > 0 || cfg.fractalAmplitude > 0 || cfg.edgeWander > 0;
+    const rng = anyEffect ? makePRNG(cfg.seed ^ 0xBEEF0002) : null;
+    const img = this.image;
     let current = this.startId;
     let out = `M ${pts[current].x} ${pts[current].y}\n`;
     while (pts[current].next !== NO_ID) {
@@ -973,7 +1088,15 @@ class Points {
       if (dx * dx + dy * dy >= maxReachSq) {
         out += `M ${pts[next].x} ${pts[next].y}\n`;
       } else {
-        out += `L ${pts[next].x} ${pts[next].y}\n`;
+        let ex = pts[next].x, ey = pts[next].y;
+        if (cfg.noiseAmplitude > 0) {
+          [ex, ey] = perpDisplace(ex, ey, pts[current].x, pts[current].y, ex, ey, cfg.noiseAmplitude, rng());
+        }
+        if (cfg.fractalAmplitude > 0 || cfg.edgeWander > 0) {
+          out += fractalSubdivideEdge(pts[current].x, pts[current].y, ex, ey, 2, cfg.fractalAmplitude, cfg.edgeWander, rng, img);
+        } else {
+          out += `L ${ex} ${ey}\n`;
+        }
       }
       current = next;
     }
@@ -982,6 +1105,7 @@ class Points {
 
   outputSVGCubic() {
     const pts = this.points;
+    const cfg = this.config;
     const alpha = 0.5 / 2.0;
     // Angle below which three consecutive points are considered collinear (in radians)
     const straightThreshold = 0.15; // ~8.6 degrees
@@ -1012,7 +1136,10 @@ class Points {
       return Math.abs(Math.atan2(Math.abs(cross), dot));
     }
 
-    const maxReachSq = this.config.maxReach * this.config.maxReach;
+    const maxReachSq = cfg.maxReach * cfg.maxReach;
+    const anyEffect = cfg.noiseAmplitude > 0 || cfg.fractalAmplitude > 0 || cfg.controlPointNoise > 0 || cfg.edgeWander > 0;
+    const rng = anyEffect ? makePRNG(cfg.seed ^ 0xCAFE0003) : null;
+    const img = this.image;
 
     let previous = this.startId;
     let current = this.startId;
@@ -1034,16 +1161,33 @@ class Points {
         out += `M ${pts[next].x} ${pts[next].y}\n`;
         previous = next; // reset curve context after a jump
       } else {
+        // Compute displaced endpoint (noise along path — cosmetic only)
+        let ex = pts[next].x, ey = pts[next].y;
+        if (cfg.noiseAmplitude > 0) {
+          [ex, ey] = perpDisplace(ex, ey, pts[current].x, pts[current].y, ex, ey, cfg.noiseAmplitude, rng());
+        }
+
         const angle = turningAngle(pts[previous], pts[current], pts[next]);
         const straight = angle < straightThreshold;
 
         if (straight) {
           if (inCurve) { out += `\n`; inCurve = false; }
-          out += `L ${pts[next].x} ${pts[next].y}\n`;
+          if (cfg.fractalAmplitude > 0 || cfg.edgeWander > 0) {
+            out += fractalSubdivideEdge(pts[current].x, pts[current].y, ex, ey, 2, cfg.fractalAmplitude, cfg.edgeWander, rng, img);
+          } else {
+            out += `L ${ex} ${ey}\n`;
+          }
         } else {
           if (!inCurve) { out += `C\n`; inCurve = true; }
-          const [cx1, cy1, cx2, cy2] = splineControls(pts[previous], pts[current], pts[next], pts[future !== NO_ID ? future : next]);
-          out += `${cx1},${cy1} ${cx2},${cy2} ${pts[next].x},${pts[next].y}\n`;
+          let [cx1, cy1, cx2, cy2] = splineControls(pts[previous], pts[current], pts[next], pts[future !== NO_ID ? future : next]);
+          if (cfg.controlPointNoise > 0) {
+            const n = cfg.controlPointNoise;
+            cx1 += (rng() * 2 - 1) * n;
+            cy1 += (rng() * 2 - 1) * n;
+            cx2 += (rng() * 2 - 1) * n;
+            cy2 += (rng() * 2 - 1) * n;
+          }
+          out += `${cx1},${cy1} ${cx2},${cy2} ${ex},${ey}\n`;
         }
         previous = current;
       }
@@ -1057,6 +1201,325 @@ class Points {
   }
 }
 
+// ─── Stitch mode builders ────────────────────────────────────────────────────
+
+// Returns 'L' if the straight line from (x0,y0)→(x1,y1) stays within foreground
+// pixels, or 'M' if it crosses white space. Samples every ~2px along the segment.
+function lineCmd(x0, y0, x1, y1, data, width, height, wc) {
+  const dx = x1 - x0, dy = y1 - y0;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < 2) return 'L';
+  const steps = Math.ceil(dist / 2);
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const px = Math.round(x0 + dx * t);
+    const py = Math.round(y0 + dy * t);
+    if (px < 0 || py < 0 || px >= width || py >= height) return 'M';
+    if (data[py * width + px] >= wc) return 'M';
+  }
+  return 'L';
+}
+
+// Collect all foreground pixels from img.pixels (value < whiteCutoff).
+function collectForeground(img, whiteCutoff) {
+  const pixels = [];
+  const { pixels: data, width, height } = img;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (data[y * width + x] < whiteCutoff) pixels.push({ x, y });
+    }
+  }
+  return pixels;
+}
+
+// PCA: returns dominant axis [vx, vy] (unit vector) for a set of {x,y} points.
+function dominantAxis(pts) {
+  if (pts.length === 0) return [1, 0];
+  let mx = 0, my = 0;
+  for (const p of pts) { mx += p.x; my += p.y; }
+  mx /= pts.length; my /= pts.length;
+  let cxx = 0, cxy = 0, cyy = 0;
+  for (const p of pts) {
+    const dx = p.x - mx, dy = p.y - my;
+    cxx += dx * dx; cxy += dx * dy; cyy += dy * dy;
+  }
+  const diff = (cxx - cyy) / 2;
+  const theta = Math.atan2(cxy, diff + Math.sqrt(diff * diff + cxy * cxy));
+  return [Math.cos(theta), Math.sin(theta)];
+}
+
+// Find contiguous foreground runs along the scan line at perpendicular offset t,
+// using the actual image pixels rather than projection approximation.
+// Returns [[minS, maxS], ...] runs sorted by S, where S is projection along vx/vy.
+function scanLineRuns(img, wc, t, vx, vy, px, py, spacing) {
+  const { pixels: data, width, height } = img;
+  // Sample pixels along the scan line at 1px increments
+  // Find extent of image along the dominant axis
+  const maxS = Math.max(width * Math.abs(vx), height * Math.abs(vy)) * 1.5;
+  const runs = [];
+  let inRun = false, runStart = 0;
+
+  for (let si = -maxS; si <= maxS; si++) {
+    const ix = Math.round(si * vx + t * px);
+    const iy = Math.round(si * vy + t * py);
+    const fg = ix >= 0 && iy >= 0 && ix < width && iy < height && data[iy * width + ix] < wc;
+    if (fg && !inRun) { inRun = true; runStart = si; }
+    else if (!fg && inRun) { runs.push([runStart, si - 1]); inRun = false; }
+  }
+  if (inRun) runs.push([runStart, maxS]);
+  return runs;
+}
+
+// Satin stitch: parallel slightly-curved lines along dominant axis, boustrophedon.
+// Lines are connected end-to-end (one continuous stroke). Step between scan lines
+// varies with local luminance — dark areas get denser lines (smaller step), light
+// areas get sparser lines (larger step). Each stitch bows slightly perpendicular
+// to give a curved/fabric feel; bow alternates direction each row.
+function buildSatin(img, config) {
+  const wc = config.whiteCutoff != null ? config.whiteCutoff : 240;
+  const { pixels: data, width, height } = img;
+  const pts = collectForeground(img, wc);
+  if (pts.length === 0) return '';
+
+  const [vx, vy] = dominantAxis(pts);
+  const px = -vy, py = vx; // perpendicular direction
+
+  const baseSpacing = Math.max(config.strokeWidth, Math.round(config.pointDensity * 0.6));
+  const minStep = Math.max(1, Math.ceil(config.strokeWidth));
+  const maxStep = Math.round(baseSpacing * 2.5);
+  // Bow: max perpendicular deflection as fraction of stitch half-length
+  const bowFrac = 0.18;
+
+  // Find T extent
+  let minT = Infinity, maxT = -Infinity;
+  for (const p of pts) {
+    const t = p.x * px + p.y * py;
+    if (t < minT) minT = t;
+    if (t > maxT) maxT = t;
+  }
+
+  // Average foreground luminance along scan line at t (sampled every 3px)
+  function avgLumAtT(t) {
+    let sum = 0, count = 0;
+    const maxS = Math.max(width * Math.abs(vx), height * Math.abs(vy)) * 1.5;
+    for (let si = -maxS; si <= maxS; si += 3) {
+      const ix = Math.round(si * vx + t * px);
+      const iy = Math.round(si * vy + t * py);
+      if (ix >= 0 && iy >= 0 && ix < width && iy < height) {
+        const lum = data[iy * width + ix];
+        if (lum < wc) { sum += lum; count++; }
+      }
+    }
+    return count > 0 ? sum / count : wc - 1;
+  }
+
+  let d = '';
+  let prevEndX = null, prevEndY = null;
+  let lineIdx = 0;
+  let t = minT;
+
+  while (t <= maxT) {
+    const runs = scanLineRuns(img, wc, t, vx, vy, px, py, baseSpacing);
+
+    if (runs.length > 0) {
+      const forward = (lineIdx % 2 === 0);
+      const bowSign = (lineIdx % 2 === 0) ? 1 : -1; // alternate bow direction
+      const orderedRuns = forward ? runs : [...runs].reverse();
+
+      for (const [ra, rb] of orderedRuns) {
+        const s0 = forward ? ra : rb, s1 = forward ? rb : ra;
+        const x0 = s0 * vx + t * px, y0 = s0 * vy + t * py;
+        const x1 = s1 * vx + t * px, y1 = s1 * vy + t * py;
+
+        if (prevEndX !== null) {
+          // Always connect with L — the short connector between adjacent satin lines
+          // is an intentional tie-off stitch in real embroidery. Only jump (M) when
+          // previous run was from a completely different scan group (prevEndX was null
+          // at start of this group), which is handled by the else branch below.
+          d += `L ${x0.toFixed(1)} ${y0.toFixed(1)}\n`;
+        } else {
+          d += `M ${x0.toFixed(1)} ${y0.toFixed(1)}\n`;
+        }
+
+        // Curved stitch: quadratic bezier with control point bowing perpendicular
+        const halfLen = (s1 - s0) / 2;
+        const midS = (s0 + s1) / 2;
+        const bow = bowSign * halfLen * bowFrac;
+        const cpx = midS * vx + (t + bow) * px;
+        const cpy = midS * vy + (t + bow) * py;
+        d += `Q ${cpx.toFixed(1)} ${cpy.toFixed(1)} ${x1.toFixed(1)} ${y1.toFixed(1)}\n`;
+
+        prevEndX = x1; prevEndY = y1;
+      }
+      lineIdx++;
+    } else {
+      prevEndX = null;
+    }
+
+    // Variable step: dark→minStep, light→maxStep
+    const lum = avgLumAtT(t);
+    const frac = lum / (wc - 1);
+    const step = Math.round(minStep + frac * (maxStep - minStep));
+    t += Math.max(1, step);
+  }
+  return d;
+}
+
+// Fill stitch: boustrophedon horizontal rows with tone-modulated stitch length.
+// Dark pixels → full-length stitches; lighter pixels → shorter stitches with gaps.
+// This creates tonal shading characteristic of real fill embroidery.
+function buildFill(img, config) {
+  const wc = config.whiteCutoff != null ? config.whiteCutoff : 240;
+  const { pixels: data, width, height } = img;
+  // Spacing tied to density: higher density → finer rows
+  const spacing = Math.max(2, Math.round(config.pointDensity * 0.6));
+  // Stitch pitch: distance between individual stitches within a run
+  const pitch = Math.max(3, spacing * 2);
+
+  let d = '';
+  let prevEndX = null, prevEndY = null;
+  let rowIdx = 0;
+
+  for (let y = 0; y < height; y += spacing) {
+    // Find contiguous foreground runs on this row
+    const runs = [];
+    let runStart = -1;
+    for (let x = 0; x < width; x++) {
+      const fg = data[y * width + x] < wc;
+      if (fg && runStart < 0) { runStart = x; }
+      else if (!fg && runStart >= 0) { runs.push([runStart, x - 1]); runStart = -1; }
+    }
+    if (runStart >= 0) runs.push([runStart, width - 1]);
+    if (runs.length === 0) { prevEndX = null; continue; }
+
+    const forward = (rowIdx % 2 === 0);
+    const orderedRuns = forward ? runs : [...runs].reverse();
+
+    for (const [ra, rb] of orderedRuns) {
+      // Emit individual stitches within the run, length modulated by local darkness
+      const xStart = forward ? ra : rb;
+      const xEnd   = forward ? rb : ra;
+      const step   = forward ? pitch : -pitch;
+
+      let x = xStart;
+      let stitchStart = null;
+
+      while (forward ? x <= xEnd : x >= xEnd) {
+        const px = Math.round(x);
+        const lum = (px >= 0 && px < width) ? data[y * width + px] : wc;
+        const inFg = lum < wc;
+        // Stitch length fraction: 0 (lum near wc-1) → 1 (lum=0). Clamp to [0.15,1].
+        const frac = inFg ? Math.max(0.15, 1 - lum / (wc - 1)) : 0;
+        // Include pixel in current stitch if frac > 0.3 (mid-tone threshold)
+        const include = frac > 0.3;
+
+        if (include && stitchStart === null) {
+          stitchStart = x;
+        } else if (!include && stitchStart !== null) {
+          // Emit stitch from stitchStart to x-step
+          const sx = stitchStart, ex = x - step;
+          if (prevEndX !== null) {
+            const cmd = lineCmd(prevEndX, prevEndY, sx, y, data, width, height, wc);
+            d += `${cmd} ${sx} ${y}\n`;
+          } else {
+            d += `M ${sx} ${y}\n`;
+          }
+          d += `L ${ex} ${y}\n`;
+          prevEndX = ex; prevEndY = y;
+          stitchStart = null;
+        }
+        x += step;
+      }
+      // Flush remaining stitch
+      if (stitchStart !== null) {
+        const sx = stitchStart, ex = xEnd;
+        if (prevEndX !== null) {
+          const cmd = lineCmd(prevEndX, prevEndY, sx, y, data, width, height, wc);
+          d += `${cmd} ${sx} ${y}\n`;
+        } else {
+          d += `M ${sx} ${y}\n`;
+        }
+        d += `L ${ex} ${y}\n`;
+        prevEndX = ex; prevEndY = y;
+      }
+    }
+    rowIdx++;
+  }
+  return d;
+}
+
+// Cross-stitch: X marks on a grid, traced as a single continuous path.
+// Spacing tied to density slider. Arm size varies with local pixel darkness
+// (darker = larger X) to create tonal shading.
+function buildCross(img, config) {
+  const wc = config.whiteCutoff != null ? config.whiteCutoff : 240;
+  const { pixels: data, width, height } = img;
+  // Spacing tied to density; cross-stitch needs more room than fill so multiply by 2.
+  // Also ensure spacing is large enough for arm to clearly exceed stroke-width.
+  const minSpacing = Math.max(8, Math.round(config.strokeWidth * 4));
+  const spacing = Math.max(minSpacing, Math.round(config.pointDensity * 2.5));
+  const maxArm = Math.max(Math.round(config.strokeWidth * 1.5), Math.round(spacing * 0.38));
+  const minArm = Math.max(Math.round(config.strokeWidth * 0.8), Math.round(spacing * 0.12));
+
+  const rows = [];
+  for (let y = maxArm + 1; y < height - maxArm - 1; y += spacing) {
+    const row = [];
+    for (let x = maxArm + 1; x < width - maxArm - 1; x += spacing) {
+      const lum = data[y * width + x];
+      if (lum < wc) {
+        // arm size proportional to darkness: lum=0 → maxArm, lum=wc-1 → minArm
+        const frac = 1 - lum / (wc - 1);
+        const arm = Math.round(minArm + frac * (maxArm - minArm));
+        row.push({ x, arm });
+      }
+    }
+    if (row.length > 0) rows.push({ y, pts: row });
+  }
+  if (rows.length === 0) return '';
+
+  let d = '';
+  let cx = null, cy = null;
+
+  for (let ri = 0; ri < rows.length; ri++) {
+    const { y, pts } = rows[ri];
+    const forward = (ri % 2 === 0);
+    const centres = forward ? pts : [...pts].reverse();
+
+    for (const { x, arm } of centres) {
+      const tl = [x - arm, y - arm], br = [x + arm, y + arm];
+      const tr = [x + arm, y - arm], bl = [x - arm, y + arm];
+
+      if (cx === null) {
+        d += `M ${tl[0]} ${tl[1]}\n`;
+      } else {
+        const cmd = lineCmd(cx, cy, tl[0], tl[1], data, width, height, wc);
+        d += `${cmd} ${tl[0]} ${tl[1]}\n`;
+      }
+      d += `L ${br[0]} ${br[1]}\n`;
+      d += `L ${x} ${y}\n`;
+      d += `L ${tr[0]} ${tr[1]}\n`;
+      d += `L ${bl[0]} ${bl[1]}\n`;
+      d += `L ${x} ${y}\n`;
+      cx = x; cy = y;
+    }
+  }
+  return d;
+}
+
+function buildStitchSVG(img, config) {
+  const w = config.width, h = config.height;
+  let d = '';
+  switch (config.stitchMode) {
+    case 'satin':   d = buildSatin(img, config); break;
+    case 'fill':    d = buildFill(img, config); break;
+    case 'cross':   d = buildCross(img, config); break;
+    default: return '';
+  }
+  return `<svg viewBox='0 0 ${w} ${h}' width='${w}' height='${h}' xmlns='http://www.w3.org/2000/svg'>\n` +
+         `<path stroke='black' fill='none' stroke-width='${config.strokeWidth}' d='${d}' />\n` +
+         `</svg>\n`;
+}
+
 // ─── Config factory ──────────────────────────────────────────────────────────
 
 function makeConfig(w, h, opts) {
@@ -1064,13 +1527,28 @@ function makeConfig(w, h, opts) {
   // Reference: maxDim=4500 (resolution=30) → scale=1.
   const maxDim = Math.max(w, h);
   const scale = maxDim / 4500;
-  const s = (base) => Math.max(1, Math.round(base * scale));
+  const s  = (base) => Math.max(1, Math.round(base * scale));
+  const sw = (base) => Math.round(base * scale); // no min-1 floor — allows 0 at small images
+
+  // Base density from slider (lower maxDensity value = denser)
+  const baseDensity = opts.maxDensity != null ? opts.maxDensity : 10;
+  // Lock density: scale pointDensity proportionally with lineWidth so strokeWidth/spacing stays constant.
+  // Reference lineWidth = 4. At lineWidth=2, density halves (twice as fine spacing).
+  const refLineWidth = 4;
+  const lineWidthFactor = opts.lockDensity && opts.lineWidth ? opts.lineWidth / refLineWidth : 1;
+  const scaledDensity = Math.max(0.5, baseDensity * lineWidthFactor);
+
+  // pointDensityWhite scales with density slider so all brightness areas are affected uniformly.
+  // At baseDensity=10, white areas get spacing 50 (same as before); denser slider → smaller white spacing.
+  const densityRatio = scaledDensity / 10; // 1 at default, >1 = sparser, <1 = denser
+  const whiteDensity = 50 * densityRatio;
+
   return {
-    seed: 0,
+    seed:              opts.seed != null ? opts.seed : 0,
     width: w,
     height: h,
-    pointDensity: s(opts.maxDensity != null ? opts.maxDensity : 10),
-    pointDensityWhite: s(50),
+    pointDensity: s(scaledDensity),
+    pointDensityWhite: s(whiteDensity),
     whiteCutoff: opts.whiteCutoff,
     invert: !!opts.invert,
     neighborhood: s(15),
@@ -1083,6 +1561,14 @@ function makeConfig(w, h, opts) {
     minRadianDifference: 20 * Math.PI * 2 / 360,
     strokeWidth: opts.lineWidth,
     smoothPath: true,
+    // ── Wiggle / noise effects (all default to 0 = off) ──────────────────────
+    jitterStrength:    opts.jitterStrength    != null ? opts.jitterStrength    : 0, // 0–100 % of local spacing
+    noiseAmplitude:    opts.noiseAmplitude    != null ? sw(opts.noiseAmplitude)    : 0, // px at ref scale
+    fractalAmplitude:  opts.fractalAmplitude  != null ? sw(opts.fractalAmplitude)  : 0, // px at ref scale
+    controlPointNoise: opts.controlPointNoise != null ? sw(opts.controlPointNoise) : 0, // px at ref scale
+    edgeWander:        opts.edgeWander        != null ? opts.edgeWander        : 0, // 0–100 strength
+    // ── Stitch mode ──────────────────────────────────────────────────────────
+    stitchMode: opts.stitchMode || 'oneline', // 'oneline'|'satin'|'fill'|'running'|'cross'
   };
 }
 
@@ -1175,11 +1661,19 @@ async function build(options, seq) {
 
   img.adjustExposure(options.exposure != null ? options.exposure : 50);
   img.adjustContrast(options.contrast, options.whiteCutoff, options.invert);
-  img.applyEdgeBlend(options.edgeStrength || 0, options.invert);
+  img.applyEdgeBlend(options.edgeStrength || 0, options.invert, options.whiteCutoff != null ? options.whiteCutoff : 240);
 
   const config = makeConfig(img.width, img.height, options);
+
+  // Non-oneline/running modes bypass the graph builder entirely.
+  if (config.stitchMode !== 'oneline' && config.stitchMode !== 'running') {
+    const svg = buildStitchSVG(img, config);
+    return { success: true, seq, result: svg, width: config.width, height: config.height, lineLength: 0 };
+  }
+
   const points = new Points(config);
   points.fillRandom(img);
+  points.image = img; // kept for edge-wander access in output stage
   points.makeGrid();
   if (points.points.length < 2) {
     return { success: true, seq, result: `<svg viewBox='0 0 ${config.width} ${config.height}' width='${config.width}' height='${config.height}' xmlns='http://www.w3.org/2000/svg'><path stroke='black' fill='none' stroke-width='1' d='' /></svg>`, width: config.width, height: config.height, lineLength: 0 };
@@ -1229,6 +1723,7 @@ addEventListener('message', async (event) => {
     case 'buildGrayscale': {
       setGrayscale(msg.data, msg.width, msg.height);
       const options = JSON.parse(msg.options);
+      options.stitchMode = msg.stitchMode || 'oneline';
       let result;
       try {
         result = await build(options, msg.seq);
